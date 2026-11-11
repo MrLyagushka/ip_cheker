@@ -42,9 +42,21 @@ def load_env():
         with open(ENV_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    os.environ[key.strip()] = value.strip().strip('"\'')
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                value = value.strip()
+                # Инлайн-комментарий вне кавычек: KEY = "v"  # comment -> v
+                if value[:1] not in ('"', "'"):
+                    value = value.split("#", 1)[0].strip()
+                else:
+                    quote = value[0]
+                    end = value.find(quote, 1)
+                    if end != -1:
+                        value = value[1:end]  # содержимое в кавычках, хвост-комментарий отбрасывается
+                    else:
+                        value = value.strip(quote)
+                os.environ[key.strip()] = value
 
 def save_env_value(key_to_update, new_value):
     lines = []
@@ -55,7 +67,12 @@ def save_env_value(key_to_update, new_value):
     
     new_lines = []
     for line in lines:
-        if line.strip().startswith(f"{key_to_update}="):
+        # Сопоставление по ключу с учётом пробелов вокруг «=»: старый код
+        # искал «PROXY_URL=», а в .env строка вида «PROXY_URL = "..."» —
+        # из-за этого значение не заменялось, а дублировалось новой строкой.
+        stripped = line.strip()
+        if stripped.startswith(f"{key_to_update}=") or \
+                ("=" in stripped and stripped.split("=", 1)[0].strip() == key_to_update):
             new_lines.append(f"{key_to_update}={new_value}\n")
             found = True
         else:
@@ -275,6 +292,26 @@ def expand_targets(raw_args: list[str]) -> tuple[list[str], list[str]]:
             targets.append(item)
 
     return targets, invalid
+
+
+def set_proxy(new_url: str | None):
+    """Атомарная смена прокси/сессии бота (используется админ-панелью).
+
+    Обновляет config.PROXY_URL, пересоздаёт AiohttpSession и подменяет
+    сессию живого Bot без перезапуска процесса. Возвращает СТАРУЮ сессию
+    (или None) — вызывающая сторона обязана закрыть её через
+    `await old_session.close()`, чтобы не оставлять висящих соединений
+    (Б12 — полное исправление на этапе 6 в admin.py).
+    """
+    global PROXY_URL, session
+    new_url = (new_url or "").strip() or None
+    old_session = session
+    new_session = AiohttpSession(proxy=new_url) if new_url else None
+    bot.session = new_session
+    session = new_session
+    PROXY_URL = new_url
+    save_env_value("PROXY_URL", new_url or "")
+    return old_session
 
 
 def register_user(user_id: int):

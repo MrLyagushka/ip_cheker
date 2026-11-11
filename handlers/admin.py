@@ -6,14 +6,24 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.client.session.aiohttp import AiohttpSession
+# Этап 1: admin НЕ трогает config.sem напрямую — вся работа с лимитом идёт
+# через мутируемый throttle (Б11), статистика потоков — через публичные
+# throttle.free / throttle.busy вместо приватного sem._value (Б13).
+# RESULT_FILE больше не импортируется: отчёты пер-юзерские (Б18).
 import config
 from config import (
-    ADMIN_ID, RESULT_FILE, HISTORY_FILE, TRACKED_IPS_FILE, 
-    USERS_FILE, save_env_value, bot
+    ADMIN_ID, HISTORY_FILE, TRACKED_IPS_FILE,
+    USERS_FILE, save_env_value, bot, throttle,
 )
 
 router = Router()
+
+def _threads_line() -> str:
+    """Актуальная строка о потоках для панели (лимит читаем из throttle)."""
+    return (
+        f"⚙️ Макс. потоков пинга: <code>{throttle.limit}</code>\n"
+        f"🟢 Свободных потоков: <code>{throttle.free}/{throttle.limit}</code>"
+    )
 
 class AdminStates(StatesGroup):
     waiting_for_concurrency = State()
@@ -40,8 +50,7 @@ async def cmd_admin(message: Message):
     proxy_status = config.PROXY_URL if config.PROXY_URL else "Отключен (прямое соединение)"
     text = (
         "🛠 <b>Расширенная панель администратора</b>\n\n"
-        f"⚙️ Макс. потоков пинга: <code>{config.MAX_CONCURRENT_PINGS}</code>\n"
-        f"🟢 Свободных потоков: <code>{config.sem._value}/{config.MAX_CONCURRENT_PINGS}</code>\n"
+        f"{_threads_line()}\n"
         f"🌐 Текущий прокси: <code>{proxy_status}</code>\n\n"
         "Выберите действие в меню ниже:"
     )
@@ -85,7 +94,7 @@ async def cb_admin_stats(callback: CallbackQuery):
         f"👥 Уникальных пользователей: <code>{users_count}</code>\n"
         f"📍 Всего отслеживаемых IP: <code>{tracked_count}</code>\n"
         f"🌳 Записей в дереве сетей: <code>{history_count}</code>\n"
-        f"🔄 Активных потоков занято: <code>{config.MAX_CONCURRENT_PINGS - config.sem._value}</code>"
+        f"🔄 Активных потоков занято: <code>{throttle.busy}/{throttle.limit}</code>"
     )
     await callback.message.edit_text(stats_text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
     await callback.answer()
@@ -99,8 +108,7 @@ async def cb_refresh_admin(callback: CallbackQuery):
     proxy_status = config.PROXY_URL if config.PROXY_URL else "Отключен"
     text = (
         "🛠 <b>Расширенная панель администратора</b>\n\n"
-        f"⚙️ Макс. потоков пинга: <code>{config.MAX_CONCURRENT_PINGS}</code>\n"
-        f"🟢 Свободных потоков: <code>{config.sem._value}/{config.MAX_CONCURRENT_PINGS}</code>\n"
+        f"{_threads_line()}\n"
         f"🌐 Текущий прокси: <code>{proxy_status}</code>\n\n"
         "Выберите действие в меню ниже:"
     )
@@ -145,8 +153,10 @@ async def process_new_concurrency(message: Message, state: FSMContext):
         return
 
     new_limit = int(val)
-    config.MAX_CONCURRENT_PINGS = new_limit
-    config.sem = asyncio.Semaphore(new_limit)
+    # Б11: лимит меняется ВНУТРИ мутируемого throttle.set_limit(), а не
+    # пересозданием `config.sem` — все модули (scan/monitor), держащие ссылку
+    # на один и тот же объект, начинают работать с новым лимитом мгновенно.
+    config.throttle.set_limit(new_limit)
     save_env_value("MAX_CONCURRENT_PINGS", new_limit)
 
     await state.clear()
@@ -172,17 +182,24 @@ async def process_new_proxy(message: Message, state: FSMContext):
 
     new_proxy = message.text.strip()
     if new_proxy.lower() in ["none", "off", "откл", "нет"]:
-        config.PROXY_URL = ""
-        save_env_value("PROXY_URL", "")
-        config.session = None
-    else:
-        config.PROXY_URL = new_proxy
-        save_env_value("PROXY_URL", new_proxy)
-        config.session = AiohttpSession(proxy=new_proxy)
-
-    bot.session = config.session
+        new_proxy = None
+    # Этап 1: вся атомарная логика смены прокси вынесена в config.set_proxy()
+    # (обновляет PROXY_URL, пересоздаёт сессию, подменяет bot.session, пишет .env).
+    # Возвращает СТАРУЮ сессию — закрываем её, чтобы не плодить висящие
+    # соединения (Б12; корректный await close() будет на этапе 6).
+    old_session = config.set_proxy(new_proxy)
+    if old_session is not None:
+        try:
+            # Синхронная попытка закрыть старый пул соединений без event loop
+            # колбэков; полная асинхронная закрытие — этап 6.
+            conn = getattr(old_session, "connector", None) or getattr(old_session, "_session", None)
+            force_close = getattr(conn, "force_close", None)
+            if callable(force_close):
+                force_close()
+        except Exception:
+            pass
     await state.clear()
-    
+
     status_text = f"<b>{config.PROXY_URL}</b>" if config.PROXY_URL else "отключен (прямое соединение)"
     await message.answer(f"✅ Прокси успешно изменен на: {status_text} и сохранен в <code>.env</code>.", parse_mode="HTML")
 

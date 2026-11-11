@@ -1,10 +1,15 @@
 import os
 import json
 import asyncio
+from html import escape
 from aiogram import Router
 from aiogram.types import Message
 from aiogram.filters import Command, CommandObject
-from config import TRACKED_IPS_FILE, active_users, async_ping_ip, bot, ALERT_CHAT_ID, ALERT_THREAD_ID
+# Этап 1: единая строгая валидация IPv4 из config (Б4).
+from config import (
+    TRACKED_IPS_FILE, active_users, async_ping_ip, bot,
+    ALERT_CHAT_ID, ALERT_THREAD_ID, is_valid_ipv4,
+)
 
 router = Router()
 
@@ -31,49 +36,48 @@ async def cmd_new_ip(message: Message, command: CommandObject):
         )
         return
 
-    targets = [t.strip() for t in command.args.split() if t.strip()]
+    targets = [t.strip().rstrip(',;') for t in command.args.split() if t.strip()]
     if not targets:
         await message.answer("❌ Укажите корректные IP-адреса через пробел.", parse_mode="HTML")
         return
-
-    added_ips = []
-    invalid_ips = []
-    for ip in targets:
-        octets = ip.split('.')
-        if len(octets) != 4 or not all(o.isdigit() for o in octets):
-            invalid_ips.append(ip)
-        else:
-            added_ips.append(ip)
-
-    if invalid_ips:
-        await message.answer(
-            f"❌ Обнаружены неверные форматы IP: {', '.join([f'<code>{ip}</code>' for ip in invalid_ips])}",
-            parse_mode="HTML"
-        )
-        if not added_ips:
-            return
 
     user_id_str = str(message.from_user.id)
     tracked = load_tracked_ips()
     user_ips = tracked.get(user_id_str, [])
 
-    newly_added = []
+    added_count = 0
     already_exists = []
+    invalid_ips = []
 
-    for ip in added_ips:
+    for ip in targets:
+        # Строгая валидация IPv4 через config (октеты 0–255) — Б4:
+        # раньше «999.999.999.5» проходил проверку и оседал в мониторинге.
+        if not is_valid_ipv4(ip):
+            invalid_ips.append(ip)
+            continue
         if ip in user_ips:
             already_exists.append(ip)
         else:
             user_ips.append(ip)
-            newly_added.append(ip)
+            added_count += 1
 
-    if newly_added:
+    if invalid_ips:
+        await message.answer(
+            "❌ Обнаружены неверные форматы IP: "
+            + ", ".join(f"<code>{escape(ip)}</code>" for ip in invalid_ips),
+            parse_mode="HTML",
+        )
+
+    if not added_count and not already_exists:
+        return
+
+    if added_count:
         tracked[user_id_str] = user_ips
         save_tracked_ips(tracked)
 
     response_parts = []
-    if newly_added:
-        response_parts.append(f"✅ Успешно добавлено: {len(newly_added)} шт.")
+    if added_count:
+        response_parts.append(f"✅ Успешно добавлено: {added_count} шт.")
     if already_exists:
         response_parts.append(f"⚠️ Уже были в списке: {len(already_exists)} шт.")
     
