@@ -34,3 +34,6 @@ nohup.out
 .vscode/
 *.swp
 .DS_Store
+
+# Старый архивный код (не коммитить)
+old/
