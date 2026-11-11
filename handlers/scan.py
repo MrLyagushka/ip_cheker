@@ -214,4 +214,4 @@ async def cmd_scan(message: Message, command: CommandObject):
             await message.answer("⚠️ Файл результатов пуст.")
 
     finally:
-        active_users.remove(user_id)
+        active_users.discard(user_id)

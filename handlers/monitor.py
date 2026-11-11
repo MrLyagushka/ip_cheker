@@ -3,12 +3,19 @@ import json
 import asyncio
 from html import escape
 from aiogram import Router
+# В aiogram 3.15+ класс переименован из TelegramForbiddenException в TelegramForbiddenError;
+# fallback на старый алиас совместим с более ранними версиями.
+try:
+    from aiogram.exceptions import TelegramForbiddenError as TelegramForbiddenException
+except ImportError:  # pragma: no cover - старые версии aiogram 3.x
+    from aiogram.exceptions import TelegramForbiddenException
 from aiogram.types import Message
 from aiogram.filters import Command, CommandObject
 # Этап 1: единая строгая валидация IPv4 из config (Б4).
+# Этап 2: параллельный опрос через ping_many (Б10), crash-guard цикла.
 from config import (
-    TRACKED_IPS_FILE, active_users, async_ping_ip, bot,
-    ALERT_CHAT_ID, ALERT_THREAD_ID, is_valid_ipv4,
+    TRACKED_IPS_FILE, active_users, bot,
+    ALERT_CHAT_ID, ALERT_THREAD_ID, is_valid_ipv4, ping_many,
 )
 
 router = Router()
@@ -180,9 +187,10 @@ async def cmd_check_ip(message: Message):
     status_msg = await message.answer(f"⏳ Внеплановая проверка {len(user_ips)} ваших IP запущена...", parse_mode="HTML")
 
     try:
-        tasks = [async_ping_ip(ip) for ip in user_ips]
-        results_bools = await asyncio.gather(*tasks)
-        results = list(zip(user_ips, results_bools))
+        # Параллельный опрос через единый пул throttle (Б10/Б19):
+        # ping_many возвращает {ip: alive}, ошибки отдельных пингов изолированы.
+        res_map = await ping_many(list(user_ips))
+        results = [(ip, res_map.get(ip, False)) for ip in user_ips]
 
         alive_count = sum(1 for _, alive in results if alive)
         dead_count = len(results) - alive_count
@@ -193,73 +201,115 @@ async def cmd_check_ip(message: Message):
         ]
         for ip, alive in results:
             status_icon = "🟢" if alive else "🔴"
-            report_lines.append(f"{status_icon} <code>{ip}</code>")
-        
+            report_lines.append(f"{status_icon} <code>{escape(ip)}</code>")
+
         report_lines.append(f"\n🟢 Доступно: <b>{alive_count}</b> | 🔴 Недоступно: <b>{dead_count}</b>")
 
         await status_msg.edit_text("\n".join(report_lines), parse_mode="HTML")
+    except Exception as e:
+        print(f"Ошибка внеплановой проверки для {user_id}: {e}")
+        try:
+            await status_msg.edit_text("❌ <b>Проверка завершилась с ошибкой.</b>", parse_mode="HTML")
+        except Exception:
+            pass
     finally:
-        active_users.remove(user_id)
+        active_users.discard(user_id)
 
-# Фоновая задача автоматического мониторинга раз в час (3600 секунд)
-async def hourly_monitor_loop():
-    while True:
-        await asyncio.sleep(3600)
-        tracked = load_tracked_ips()
-        if not tracked:
+async def _check_user_ips(user_id_str: str, ips: list[str]) -> dict:
+    """Параллельный опрос IP одного пользователя (Б10).
+
+    gather по всем адресам сразу; конкурентность ограничена общим
+    config.throttle (семафором), поэтому очередь Telegram не забивается.
+    Ошибки валидации/пинга отдельного IP не должны ронять весь цикл.
+    """
+    try:
+        res = await ping_many(list(ips))
+    except Exception as e:
+        print(f"Ошибка пинг-пакета для пользователя {user_id_str}: {e}")
+        res = {ip: False for ip in ips}
+    return {"user_id": int(user_id_str), "results": [(ip, alive) for ip, alive in res.items()]}
+
+
+def _format_report(results: list[tuple[str, bool]]) -> str:
+    lines = ["⏰ <b>Ежечасный автоотчет мониторинга:</b>", "━" * 22]
+    alive_count = 0
+    for ip, alive in results:
+        alive_count += 1 if alive else 0
+        lines.append(f"{'🟢' if alive else '🔴'} <code>{escape(str(ip))}</code>")
+    dead_count = len(results) - alive_count
+    lines.append("")
+    lines.append(f"🟢 Доступно: <b>{alive_count}</b> | 🔴 Недоступно: <b>{dead_count}</b>")
+    return "\n".join(lines)
+
+
+def _format_alert(user_id: int, dead_ips: list[str]) -> str:
+    """Формирует текст аварийного алерта с тегом владельца (Б1).
+
+    Исправление критического бага: раньше `alert_text` был строкой, к которой
+    вызывался `.append()` — это кидало AttributeError на каждой итерации и
+    полностью убивало фоновый цикл мониторинга. Теперь используется список строк.
+    """
+    mention = f'<a href="tg://user?id={user_id}">Владелец</a>'
+    alert_lines = [
+        "🚨 <b>Внимание! Обнаружены недоступные хосты!</b>",
+        f"👤 Владелец: {mention}",
+        "━" * 22,
+    ]
+    alert_lines += [f"🔴 <code>{escape(ip)}</code>" for ip in dead_ips]
+    return "\n".join(alert_lines)
+
+
+async def hourly_monitor_tick():
+    """Один проход ежечасного мониторинга (без while/sleep)."""
+    tracked = load_tracked_ips()
+    if not tracked:
+        return
+
+    # Параллельный опрос всех пользователей сразу (Б10): ошибки отдельных
+    # пользователей изолированы через return_exceptions=True.
+    tasks = [_check_user_ips(uid, ips) for uid, ips in tracked.items() if ips]
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for outcome in outcomes:
+        if isinstance(outcome, Exception):
+            print(f"Пропущен пользователь из-за ошибки опроса: {outcome}")
             continue
 
-        for user_id_str, ips in tracked.items():
-            if not ips:
-                continue
-            user_id = int(user_id_str)
-            
-            results = []
-            for ip in ips:
-                alive = await async_ping_ip(ip)
-                results.append((ip, alive))
+        user_id = outcome["user_id"]
+        results = outcome["results"]
+        dead_ips = [ip for ip, alive in results if not alive]
 
-            alive_count = sum(1 for _, alive in results if alive)
-            dead_count = len(results) - alive_count
+        # 1. Персональный отчёт в личку. Различаем блокировку бота и прочие ошибки.
+        try:
+            await bot.send_message(user_id, _format_report(results), parse_mode="HTML")
+        except TelegramForbiddenException:
+            # Пользователь заблокировал бота — отчёт не доставлен, но алерт
+            # в групповой чат всё равно уходит (серверы-то лежат).
+            print(f"Пользователь {user_id} заблокировал бота — автоотчёт пропущен.")
+        except Exception as e:
+            print(f"Не удалось отправить автоотчет пользователю {user_id}: {e}")
 
-            # 1. Отправляем полный ежечасный отчет пользователю в личку
-            report_lines = [
-                f"⏰ <b>Ежечасный автоотчет мониторинга:</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━"
-            ]
-            for ip, alive in results:
-                status_icon = "🟢" if alive else "🔴"
-                report_lines.append(f"{status_icon} <code>{ip}</code>")
-            
-            report_lines.append(f"\n🟢 Доступно: <b>{alive_count}</b> | 🔴 Недоступно: <b>{dead_count}</b>")
-
+        # 2. Аварийное уведомление в групповой чат с тегом владельца (Б1).
+        if ALERT_CHAT_ID and dead_ips:
             try:
-                await bot.send_message(user_id, "\n".join(report_lines), parse_mode="HTML")
+                await bot.send_message(
+                    chat_id=ALERT_CHAT_ID,
+                    text=_format_alert(user_id, dead_ips),
+                    parse_mode="HTML",
+                    message_thread_id=ALERT_THREAD_ID,
+                )
             except Exception as e:
-                print(f"Не удалось отправить автоотчет пользователю {user_id}: {e}")
+                print(f"Не удалось отправить алерт в чат {ALERT_CHAT_ID}: {e}")
 
-            # 2. Если задан ALERT_CHAT_ID, проверяем наличие упавших IP и тегаем юзера в теме чата
-            if ALERT_CHAT_ID:
-                dead_ips = [ip for ip, alive in results if not alive]
-                if dead_ips:
-                    user_mention = f"<a href='tg://user?id={user_id}'>Владелец</a>"
-                    alert_text = (
-                        f"🚨 <b>Внимание! Обнаружены недоступные хосты!</b>\n"
-                        f"👤 Владелец: {user_mention}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    )
-                    for dip in dead_ips:
-                        alert_text.append(f"🔴 <code>{dip}</code>")
-                    
-                    kwargs = {"parse_mode": "HTML"}
-                    if ALERT_THREAD_ID is not None:
-                        kwargs["message_thread_id"] = ALERT_THREAD_ID
 
-                    try:
-                        await bot.send_message(
-                            chat_id=ALERT_CHAT_ID,
-                            text="\n".join(alert_text),
-                            **kwargs
-                        )
-                    except Exception as e:
-                        print(f"Не удалось отправить алерт в чат {ALERT_CHAT_ID}: {e}")
+async def hourly_monitor_loop():
+    """Фоновый цикл: раз в 3600 сек. Crash-guard (Б10/Б22): любая ошибка
+    одного прохода не должна останавливать задачу целиком."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await hourly_monitor_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"Ошибка прохода ежечасного мониторинга (продолжаем): {e}")
