@@ -132,6 +132,10 @@ class PingThrottle:
         self.limit = max(1, int(limit))
         self._sem = asyncio.Semaphore(self.limit)
 
+    def resize(self, new_limit: int) -> None:
+        """Публичное имя из плана Этапа 6 (эквивалент set_limit)."""
+        self.set_limit(new_limit)
+
     def set_limit(self, new_limit: int) -> None:
         """Изменение лимита на лету без пересоздания объекта.
 
@@ -216,7 +220,17 @@ class ActiveUserRegistry:
 
 active_users = ActiveUserRegistry()
 
-session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else None
+def build_session(new_url: str | None):
+    """Фабрика сессий бота.
+
+    ВАЖНО (Б12): при отключённом прокси ВСЕГДА возвращается новый валидный
+    объект AiohttpSession() БЕЗ proxy — никогда None. Присваивание
+    bot.session = None ломает aiogram на следующем же запросе.
+    """
+    return AiohttpSession(proxy=new_url) if new_url else AiohttpSession()
+
+
+session = build_session(PROXY_URL)
 bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -363,16 +377,16 @@ def classify_targets(raw_args: list[str]):
 def set_proxy(new_url: str | None):
     """Атомарная смена прокси/сессии бота (используется админ-панелью).
 
-    Обновляет config.PROXY_URL, пересоздаёт AiohttpSession и подменяет
-    сессию живого Bot без перезапуска процесса. Возвращает СТАРУЮ сессию
-    (или None) — вызывающая сторона обязана закрыть её через
-    `await old_session.close()`, чтобы не оставлять висящих соединений
-    (Б12 — полное исправление на этапе 6 в admin.py).
+    Обновляет config.PROXY_URL, пересоздаёт сессию через build_session()
+    (валидный AiohttpSession даже при отключённом прокси — Б12) и подменяет
+    bot.session живого Bot без перезапуска процесса. Возвращает СТАРУЮ сессию
+    (или None) — вызывающая сторона ОБЯЗАНА закрыть её асинхронно через
+    `await old.close()` (Этап 6), чтобы не оставлять висящих соединений.
     """
     global PROXY_URL, session
     new_url = (new_url or "").strip() or None
     old_session = session
-    new_session = AiohttpSession(proxy=new_url) if new_url else None
+    new_session = build_session(new_url)
     bot.session = new_session
     session = new_session
     PROXY_URL = new_url
