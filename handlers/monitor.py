@@ -163,7 +163,9 @@ async def cmd_remove_ip(message: Message, command: CommandObject):
 async def cmd_check_ip(message: Message):
     user_id = message.from_user.id
 
-    if user_id in active_users:
+    # Атомарная проверка+занятие флага через ActiveUserRegistry (Б6);
+    # фоновый ежечасный мониторинг этот реестр не трогает (Б22).
+    if not active_users.try_acquire(user_id):
         await message.answer(
             "⚠️ <b>У вас уже запущен активный процесс сканирования или проверки!</b>\n"
             "Пожалуйста, дождитесь окончания текущей операции.",
@@ -183,7 +185,6 @@ async def cmd_check_ip(message: Message):
         )
         return
 
-    active_users.add(user_id)
     status_msg = await message.answer(f"⏳ Внеплановая проверка {len(user_ips)} ваших IP запущена...", parse_mode="HTML")
 
     try:
@@ -213,7 +214,7 @@ async def cmd_check_ip(message: Message):
         except Exception:
             pass
     finally:
-        active_users.discard(user_id)
+        active_users.release(user_id)
 
 async def _check_user_ips(user_id_str: str, ips: list[str]) -> dict:
     """Параллельный опрос IP одного пользователя (Б10).

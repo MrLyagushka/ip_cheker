@@ -170,7 +170,51 @@ class PingThrottle:
 
 throttle = PingThrottle(MAX_CONCURRENT_PINGS)
 
-active_users = set()
+
+class ActiveUserRegistry:
+    """Реестр активных интерактивных процессов (Б6, Б22).
+
+    Вместо «вечного» set — dict {user_id: started_ts}: если процесс по
+    какой-то причине не освободил флаг (упавший контейнер посреди скана),
+    запись устаревает через `ttl` секунд и автоматически чистится при
+    следующей проверке. Ограничение «1 процесс на пользователя» относится
+    только к интерактивным командам (/scan, /check_ip); фоновый ежечасный
+    мониторинг реестр не трогает (Б22).
+    """
+
+    def __init__(self, ttl: float = 30 * 60) -> None:
+        self._started: dict[int, float] = {}
+        self.ttl = ttl
+
+    def _is_stale(self, user_id: int, now: float) -> bool:
+        ts = self._started.get(user_id)
+        return ts is not None and (now - ts) > self.ttl
+
+    def try_acquire(self, user_id: int) -> bool:
+        """Занять слот процесса; False — если у пользователя уже активен процесс."""
+        now = asyncio.get_running_loop().time()
+        if self._is_stale(user_id, now):
+            self._started.pop(user_id, None)  # stale-очистка зависшей записи
+        if user_id in self._started:
+            return False
+        self._started[user_id] = now
+        return True
+
+    def is_active(self, user_id: int) -> bool:
+        now = asyncio.get_running_loop().time()
+        if self._is_stale(user_id, now):
+            self._started.pop(user_id, None)
+            return False
+        return user_id in self._started
+
+    def release(self, user_id: int) -> None:
+        self._started.pop(user_id, None)
+
+    def __len__(self) -> int:
+        return len(self._started)
+
+
+active_users = ActiveUserRegistry()
 
 session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else None
 bot = Bot(token=TOKEN, session=session)
@@ -266,9 +310,26 @@ def expand_targets(raw_args: list[str]) -> tuple[list[str], list[str]]:
       * x.x.0.0 запрещены (попадают в invalid согласно ТЗ);
       * всё, не прошедшее строгую валидацию, — в invalid.
     """
+    targets, invalid, _ = classify_targets(raw_args)
+    return targets, invalid
+
+
+def classify_targets(raw_args: list[str]):
+    """Как expand_targets, но возвращает ещё и план истории (Б9, Б3).
+
+    Третье значение — список записей для networks_history.json:
+      * {"type": "subnet", "target": "x.x.x.0", ...} — только для явно
+        запрошенных подсетей (полный обход 256 адресов);
+      * {"type": "host", "target": "<ip>", ...} — для одиночных IP.
+    Одиночные IP больше НЕ превращаются в псевдо-подсети /24 (Б9), а
+    запрещённые сети x.x.0.0 отсекаются на входе и не попадают ни в цели,
+    ни в историю (Б3 — закрытие обхода блокировки через историю).
+    """
     targets: list[str] = []
     invalid: list[str] = []
+    history_plan: list[dict] = []
     seen: set[str] = set()
+    seen_subnets: set[str] = set()
 
     for item in raw_args:
         item = item.strip().rstrip(",;")
@@ -279,9 +340,13 @@ def expand_targets(raw_args: list[str]) -> tuple[list[str], list[str]]:
             continue
         if item.endswith(".0"):
             if item.endswith(".0.0"):
+                # Запрещённая сеть x.x.0.0: не сканируется и не сохраняется (Б3)
                 invalid.append(item)
                 continue
             base = item[:-2]  # отрезаем ".0"
+            if item not in seen_subnets:
+                seen_subnets.add(item)
+                history_plan.append({"type": "subnet", "target": item})
             for i in range(256):
                 ip = f"{base}.{i}"
                 if ip not in seen:
@@ -290,8 +355,9 @@ def expand_targets(raw_args: list[str]) -> tuple[list[str], list[str]]:
         elif item not in seen:
             seen.add(item)
             targets.append(item)
+            history_plan.append({"type": "host", "target": item})
 
-    return targets, invalid
+    return targets, invalid, history_plan
 
 
 def set_proxy(new_url: str | None):

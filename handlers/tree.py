@@ -8,6 +8,12 @@ from config import HISTORY_FILE
 
 router = Router()
 
+
+def _type_label(item: dict) -> str:
+    """Метка типа записи истории (Б9). Legacy-записи без поля type — сети."""
+    return "🌐 сеть" if item.get("type", "subnet") == "subnet" else "📌 хост"
+
+
 @router.message(Command("tree"))
 async def cmd_tree(message: Message):
     if not os.path.exists(HISTORY_FILE):
@@ -34,15 +40,20 @@ async def cmd_tree(message: Message):
         total = item["total"]
         scan_time = item["time"]
 
-        if percent == 100.0:
+        # Цветовая индикация по ТЗ: 🟢 ровно 100%, 🔴 ровно 0%, 🔵 промежуток
+        if percent >= 100.0:
             status_icon = "🟢"
-        elif percent == 0.0:
+        elif percent <= 0.0:
             status_icon = "🔴"
         else:
             status_icon = "🔵"
 
         branch = "└──" if idx == len(history) - 1 else "├──"
-        tree_text += f"    {branch} {status_icon} <code>{target}</code> — <b>{percent:.2f}%</b> ({alive}/{total}) <i>[{scan_time}]</i>\n"
+        tree_text += (
+            f"    {branch} {status_icon} <code>{target}</code> "
+            f"[{_type_label(item)}] — <b>{percent:.2f}%</b> ({alive}/{total}) "
+            f"<i>[{scan_time}]</i>\n"
+        )
 
     tree_text += "\n<b>Легенда статусов:</b>\n"
     tree_text += "🟢 Полностью доступна (незаблочена)\n"

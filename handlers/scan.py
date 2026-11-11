@@ -1,47 +1,88 @@
-import os
+"""Команда /scan: пинг-сканирование одиночных IP и подсетей x.x.x.0.
+
+Этап 3:
+- Б5 — потоковый прогресс через asyncio.wait + троттлинг редактирования ~1 Гц
+  (вместо 4 обновлений по чанкам total//4);
+- Б17 — все edit_text в try/except TelegramAPIError, финальный результат
+  дублируется новым сообщением при провале редактирования; HTML-экранирование
+  пользовательских целей;
+- Б9/Б3 — история с типами записей subnet/host вместо псевдо-подсетей из
+  одиночных IP; запрещённые x.x.0.0 не попадают в историю ни одним путём;
+  добавлены scanned_by и ограничение размера истории;
+- Б6 — флаг активности через ActiveUserRegistry (stale-очистка зависших записей).
+"""
 import asyncio
 import json
+import os
 from datetime import datetime
 from html import escape
+
 from aiogram import Router
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command, CommandObject
+from aiogram.exceptions import TelegramAPIError
+
 # Этап 1: единый пинг/валидация из config (Б19, Б4); throttle — мутируемый
 # семафор, админский лимит действует на этот модуль мгновенно (Б11).
 import config
 from config import (
     active_users, init_files, HISTORY_FILE,
-    async_ping_ip, expand_targets, result_path_for,
+    async_ping_ip, classify_targets, result_path_for,
 )
 
 router = Router()
 
-def save_to_history(target, alive_count, total_ips, percent):
+HISTORY_MAX_ENTRIES = 500
+
+
+def save_to_history(entries: list[dict]):
+    """Сохранение результатов скана в networks_history.json (Б9, Б3).
+
+    entries — список {"type": "subnet"|"host", "target", "alive", "total",
+    "percent", "time", "scanned_by"}. Запись перезаменяет предыдущий срез
+    той же цели (dedupe по target), всего хранится не более
+    HISTORY_MAX_ENTRIES последних записей.
+    """
     history = []
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                history = json.load(f)
+                loaded = json.load(f)
+            # Однократная миграция legacy-записей без поля type → subnet
+            for item in loaded:
+                if isinstance(item, dict) and "target" in item:
+                    item.setdefault("type", "subnet")
+                    history.append(item)
         except Exception:
             history = []
-    
-    # Удаляем старую запись для этой же подсети, если она была
-    history = [item for item in history if item["target"] != target]
-    history.append({
-        "target": target,
-        "alive": alive_count,
-        "total": total_ips,
-        "percent": percent,
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
+
+    new_targets = {e["target"] for e in entries}
+    history = [item for item in history if item.get("target") not in new_targets]
+    history.extend(entries)
+    history = history[-HISTORY_MAX_ENTRIES:]
+
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=4)
+
+
+async def _safe_edit(message: Message, text: str) -> bool:
+    """edit_text с защитой от flood-control/прочих ошибок Telegram (Б17)."""
+    try:
+        await message.edit_text(text, parse_mode="HTML")
+        return True
+    except TelegramAPIError:
+        return False
+    except Exception:
+        return False
+
 
 @router.message(Command("scan"))
 async def cmd_scan(message: Message, command: CommandObject):
     user_id = message.from_user.id
 
-    if user_id in active_users:
+    # Атомарная проверка+занятие флага (Б6): без гонки между двумя
+    # одновременными /scan одного пользователя.
+    if not active_users.try_acquire(user_id):
         await message.answer(
             "⚠️ <b>У вас уже запущен активный процесс сканирования!</b>\n"
             "Пожалуйста, дождитесь окончания текущей проверки.",
@@ -49,118 +90,129 @@ async def cmd_scan(message: Message, command: CommandObject):
         )
         return
 
-    if not command.args:
-        await message.answer(
-            "❌ Вы не указали цель для сканирования!\n\n"
-            "Используйте команду с параметрами, например:\n"
-            "<code>/scan 201.8.70.166 201.8.70.175</code>\n"
-            "или для подсети:\n"
-            "<code>/scan 66.86.15.0</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    raw_args = [t.strip() for t in command.args.split() if t.strip()]
-    if not raw_args:
-        await message.answer("❌ Укажите корректные IP-адреса или подсети через пробел.", parse_mode="HTML")
-        return
-
-    # Строгая валидация IPv4 (октеты 0–255) + разворот подсетей x.x.x.0,
-    # блокировка x.x.0.0 — единый парсер config.expand_targets (Б4, Б3).
-    all_ips, invalid = expand_targets(raw_args)
-
-    if invalid:
-        await message.answer(
-            "❌ Недопустимые цели (формат IPv4 или запрещённые подсети x.x.0.0): "
-            + ", ".join(f"<code>{escape(t)}</code>" for t in invalid),
-            parse_mode="HTML",
-        )
-    if not all_ips:
-        return
-
-    active_users.add(user_id)
-    
     try:
+        if not command.args:
+            await message.answer(
+                "❌ Вы не указали цель для сканирования!\n\n"
+                "Используйте команду с параметрами, например:\n"
+                "<code>/scan 201.8.70.166 201.8.70.175</code>\n"
+                "или для подсети:\n"
+                "<code>/scan 66.86.15.0</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        raw_args = [t.strip() for t in command.args.split() if t.strip()]
+        if not raw_args:
+            await message.answer("❌ Укажите корректные IP-адреса или подсети через пробел.", parse_mode="HTML")
+            return
+
+        # Строгая валидация IPv4 (октеты 0–255) + разворот подсетей x.x.x.0,
+        # блокировка x.x.0.0, план истории с типами записей (Б4, Б3, Б9).
+        all_ips, invalid, history_plan = classify_targets(raw_args)
+
+        if invalid:
+            await message.answer(
+                "❌ Недопустимые цели (формат IPv4 или запрещённые подсети x.x.0.0): "
+                + ", ".join(f"<code>{escape(t)}</code>" for t in invalid),
+                parse_mode="HTML",
+            )
+        if not all_ips:
+            return
+
         init_files()
         display_target = ", ".join(raw_args) if len(raw_args) <= 3 else f"{len(raw_args)} целей"
-        safe_display = escape(display_target)
+        safe_display = escape(display_target)  # Б17: цели приходят от пользователя
         status_msg = await message.answer(f"⏳ Сканирование ({safe_display}) запущено...", parse_mode="HTML")
 
         total_ips = len(all_ips)
-        results_list = []
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Прогресс в реальном времени (Б5): обновляем сообщение
-        # не 4 раза по чанкам, а по мере завершения каждого ping
-        # (as_completed), но не чаще одного редактирования в ~1.5 сек,
-        # чтобы не провоцировать Telegram flood-control.
+        # ── Прогресс в реальном времени (Б5) ─────────────────────────────
+        # Каждое завершение пинга учитывается сразу; редактирование сообщения
+        # — не чаще 1 раза в секунду (Telegram limit ~20 edits/min в чат).
         results_map: dict[str, bool] = {}
         checked_count = 0
         alive_so_far = 0
         last_edit = 0.0
-        started_at = asyncio.get_running_loop().time()
+        loop = asyncio.get_running_loop()
 
-        pending = {asyncio.create_task(async_ping_ip(ip)): ip for ip in all_ips}
+        tasks = {asyncio.create_task(async_ping_ip(ip)): ip for ip in all_ips}
+        pending = set(tasks)
         try:
-            for fut in asyncio.as_completed(list(pending.keys())):
-                ip = pending[fut]
-                try:
-                    alive = await fut
-                except Exception:
-                    alive = False
-                results_map[ip] = alive
-                checked_count += 1
-                if alive:
-                    alive_so_far += 1
-
-                now = asyncio.get_running_loop().time()
-                is_final = checked_count == total_ips
-                if is_final or now - last_edit >= 1.5:
-                    last_edit = now
-                    percent = int((checked_count / total_ips) * 100)
-                    filled_count = int(10 * percent // 100)
-                    exec_bar = "🔵" * filled_count + "⬜" * (10 - filled_count)
-                    dead_so_far = checked_count - alive_so_far
-                    ratio_alive = int(10 * alive_so_far // checked_count) if checked_count > 0 else 0
-                    ratio_bar = "🟩" * ratio_alive + "🟥" * (10 - ratio_alive)
+            while pending:
+                # asyncio.as_completed в листе задач (см. ревью): await над
+                # внутренним future не даёт сопоставить результат с задачей,
+                # поэтому потоковая обработка — через wait(FIRST_COMPLETED).
+                # Учёт каждого завершения мгновенный, edit — троттлинг ~1 Гц.
+                done, pending = await asyncio.wait(
+                    pending, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in done:
+                    ip = tasks[t]
                     try:
-                        await status_msg.edit_text(
-                            f"⏳ <b>Сканирование целей:</b> <code>{safe_display}</code>\n"
-                            "━━━━━━━━━━━━━━━━━━━━\n"
-                            "⚙️ <b>Индикатор выполнения:</b>\n"
-                            f"\n<code>{exec_bar}</code> {percent}% ({checked_count}/{total_ips})\n\n"
-                            "📈 <b>Индикатор доступности (Online/Offline):</b>\n"
-                            f"\n<code>{ratio_bar}</code>\n"
-                            f"🟢 Доступно: <code>{alive_so_far}</code> | 🔴 Недоступно: <code>{dead_so_far}</code>",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        pass  # flood-control / message not modified — не ломаем скан
+                        alive = t.result() is True
+                    except (Exception, asyncio.CancelledError):
+                        alive = False
+                    results_map[ip] = alive
+                    checked_count += 1
+                    if alive:
+                        alive_so_far += 1
+
+                now = loop.time()
+                is_final = checked_count == total_ips
+                # Троттлинг редактирования ~1 Гц (Б5); финальное обновление — всегда.
+                if not is_final and now - last_edit < 1.0:
+                    continue
+                last_edit = now
+                percent = int((checked_count / total_ips) * 100)
+                filled_count = int(10 * percent // 100)
+                exec_bar = "🔵" * filled_count + "⬜" * (10 - filled_count)
+                dead_so_far = checked_count - alive_so_far
+                ratio_alive = int(10 * alive_so_far // checked_count) if checked_count > 0 else 0
+                ratio_bar = "🟩" * ratio_alive + "🟥" * (10 - ratio_alive)
+                progress_text = (
+                    f"⏳ <b>Сканирование целей:</b> <code>{safe_display}</code>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "⚙️ <b>Индикатор выполнения:</b>\n"
+                    f"\n<code>{exec_bar}</code> {percent}% ({checked_count}/{total_ips})\n\n"
+                    "📈 <b>Индикатор доступности (Online/Offline):</b>\n"
+                    f"\n<code>{ratio_bar}</code>\n"
+                    f"🟢 Доступно: <code>{alive_so_far}</code> | 🔴 Недоступно: <code>{dead_so_far}</code>"
+                )
+                await _safe_edit(status_msg, progress_text)
         finally:
             for t in pending:
-                if not t.done():
-                    t.cancel()
+                t.cancel()
 
         # Порядок результатов сохраняем по входному списку целей
         results_list = [(ip, results_map.get(ip, False)) for ip in all_ips]
 
-        # Автоматически собираем результаты в подсети (x.x.x.0)
-        subnets_data = {}
-        for ip, alive in results_list:
-            octets = ip.split('.')
-            subnet = f"{octets[0]}.{octets[1]}.{octets[2]}.0"
-            if subnet not in subnets_data:
-                subnets_data[subnet] = {"alive": 0, "total": 0}
-            subnets_data[subnet]["total"] += 1
-            if alive:
-                subnets_data[subnet]["alive"] += 1
-
-        # Сохраняем каждую получившуюся подсеть в историю отдельно
-        for subnet, data in subnets_data.items():
-            sub_alive = data["alive"]
-            sub_total = data["total"]
-            sub_percent = (sub_alive / sub_total) * 100 if sub_total > 0 else 0
-            save_to_history(subnet, sub_alive, sub_total, sub_percent)
+        # ── История: типы subnet/host вместо псевдо-подсетей (Б9, Б3) ────
+        # Подсеть = полный обход 256 адресов x.x.x.0; host = одиночный IP.
+        history_entries = []
+        for plan in history_plan:
+            if plan["type"] == "subnet":
+                base = plan["target"][:-2]  # "x.x.x."
+                subset = [(ip, a) for ip, a in results_list if ip.startswith(base)]
+            else:
+                ip = plan["target"]
+                subset = [(ip, results_map.get(ip, False))]
+            sub_alive = sum(1 for _, a in subset if a)
+            sub_total = len(subset) or 1
+            history_entries.append({
+                "type": plan["type"],
+                "target": plan["target"],
+                "alive": sub_alive,
+                "total": len(subset),
+                "percent": (sub_alive / sub_total) * 100,
+                "time": scan_time,
+                "scanned_by": user_id,
+            })
+        try:
+            save_to_history(history_entries)
+        except Exception as e:
+            print(f"Ошибка сохранения истории для {user_id}: {e}")
 
         alive_count = sum(1 for _, alive in results_list if alive)
         dead_count = total_ips - alive_count
@@ -171,8 +223,8 @@ async def cmd_scan(message: Message, command: CommandObject):
         dead_blocks = 10 - alive_blocks
         ratio_bar = "🟩" * alive_blocks + "🟥" * dead_blocks
 
-        # Пер-юзерский файл отчёта — параллельные сканы
-        # разных пользователей больше не перехватывают отчёт друг друга (Б18).
+        # Пер-юзерский файл отчёта — параллельные сканы разных пользователей
+        # больше не перехватывают отчёт друг друга (Б18).
         user_result_file = result_path_for(user_id)
         with open(user_result_file, "w", encoding="utf-8") as rf:
             rf.write("==================================================\n")
@@ -204,14 +256,25 @@ async def cmd_scan(message: Message, command: CommandObject):
             f"\n<code>{ratio_bar}</code>"
         )
 
-        await status_msg.edit_text(final_message, parse_mode="HTML")
+        # Б17: если редактирование недоступно (flood/старое сообщение) —
+        # дублируем финальный результат новым сообщением.
+        if not await _safe_edit(status_msg, final_message):
+            await message.answer(final_message, parse_mode="HTML")
 
         if user_result_file.exists() and user_result_file.stat().st_size > 0:
-            file = FSInputFile(str(user_result_file))
-            history_target_label = " ".join(raw_args)
-            await message.answer_document(file, caption=f"📁 Полный отчет аналитики для {escape(history_target_label)}")
+            file = FSInputFile(str(user_result_file), filename="result.txt")
+            await message.answer_document(
+                file,
+                caption=f"📁 Полный отчет аналитики для {escape(' '.join(raw_args))}",
+            )
         else:
             await message.answer("⚠️ Файл результатов пуст.")
 
+    except Exception as e:
+        print(f"Ошибка сканирования для {user_id}: {e!r}")
+        try:
+            await message.answer("❌ <b>Сканирование завершилось с ошибкой.</b>", parse_mode="HTML")
+        except Exception:
+            pass
     finally:
-        active_users.discard(user_id)
+        active_users.release(user_id)
