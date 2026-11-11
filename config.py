@@ -20,14 +20,21 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 
-ENV_FILE = ".env"
+# Этап 7 (инфраструктура): корень данных настраивается через DATA_DIR —
+# в docker-compose том ./data монтируется в /app/data, поэтому все файлы
+# бота лежат на диске хоста и переживают пересборку контейнера.
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+RESULTS_DIR = DATA_DIR / "results"
+
+# .env: боевой файл лежит ВНЕ образа и вне репозитория (Этап 0). По умолчанию
+# ищется рядом с кодом (локальный запуск); в Docker путь задаётся явно:
+# DATA_DIR=/app/data → /app/data/.env (пробрасывается read-only томом).
+ENV_FILE = os.getenv("ENV_FILE", str(Path(__file__).resolve().parent / ".env"))
 
 # ADMIN_ID: из окружения (.env), fallback — прежний захардкоженный id
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1424727277") or 1424727277)
 
 # ─────────────────────────── Файлы данных (data/) ───────────────────────────
-DATA_DIR = Path("data")
-RESULTS_DIR = DATA_DIR / "results"
 HISTORY_FILE = str(DATA_DIR / "networks_history.json")
 TRACKED_IPS_FILE = str(DATA_DIR / "tracked_ips.json")
 USERS_FILE = str(DATA_DIR / "users.json")
@@ -81,8 +88,23 @@ def save_env_value(key_to_update, new_value):
     if not found:
         new_lines.append(f"{key_to_update}={new_value}\n")
         
-    with open(ENV_FILE, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
+    # Этап 7: запись через temp-файл + атомарный replace. Прямое открытие на
+    # запись ломается, если ENV_FILE смонтирован как read-only bind-mount
+    # (single-file mount в Docker), и оставляет файл обрезанным при сбое
+    # диска. При ro-монтаже админская замена значения остаётся активной в
+    # текущем процессе (os.environ ниже) — предупреждаем обновить файл на хосте.
+    tmp_path = f"{ENV_FILE}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        os.replace(tmp_path, ENV_FILE)
+    except OSError as e:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        print(f"[config] ⚠️ Не удалось записать {key_to_update} в {ENV_FILE}: {e!r}. "
+              f"Значение применено в текущем процессе; обновите файл вручную.")
     os.environ[key_to_update] = str(new_value)
 
 load_env()
@@ -237,17 +259,21 @@ dp = Dispatcher(storage=MemoryStorage())
 
 def init_files():
     """Создаёт структуру data/ и файлы по умолчанию; мигрирует старые данные."""
-    DATA_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Однократная миграция legacy-файлов из корня репозитория в data/
+    # (Этап 7: раньше данные лежали в корне и монтировались томом всего
+    # репозитория; теперь — только ./data).
+    repo_root = Path(__file__).resolve().parent
     for legacy, dest in (
         ("networks_history.json", HISTORY_FILE),
         ("tracked_ips.json", TRACKED_IPS_FILE),
         ("users.json", USERS_FILE),
     ):
-        if os.path.exists(legacy) and not os.path.exists(dest):
-            Path(legacy).rename(dest)
+        legacy_path = repo_root / legacy
+        if legacy_path.exists() and not os.path.exists(dest):
+            legacy_path.rename(dest)
 
     default_content = {HISTORY_FILE: "[]", TRACKED_IPS_FILE: "{}", USERS_FILE: "[]"}
     for f, empty in default_content.items():

@@ -1,5 +1,10 @@
-version: '3.8'
-
+# Этап 7 (инфраструктура): вместо монтирования всего репозитория `.:/app`
+# (перекрывал код в образе, тянул секреты/мусор внутрь) — точечные тома:
+#   ./data            → рантайм-данные бота (история, трекинги, users, results)
+#   ./data/.env       → конфигурация/секреты read-only (в образ не печатается)
+# env_file на хосте по-прежнему читает compose; внутри контейнера config.py
+# использует ENV_FILE=/app/data/.env, чтобы админская запись значений
+# (MAX_CONCURRENT_PINGS, PROXY_URL) попадала в тот же файл.
 services:
   ping-bot:
     build: .
@@ -7,5 +12,9 @@ services:
     restart: always
     env_file:
       - .env
+    environment:
+      DATA_DIR: /app/data
+      ENV_FILE: /app/data/.env
     volumes:
-      - .:/app
+      - ./data:/app/data
+      - ./data/.env:/app/data/.env:ro

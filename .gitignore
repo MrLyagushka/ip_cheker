@@ -3,7 +3,11 @@
 *.env.local
 .env.*.local
 
-# --- Данные рантайма / пользовательские файлы ---
+# --- Данные рантайма / конфигурация (каталог DATA_DIR, Этап 7) ---
+data/
+.env
+
+# --- Legacy: старые файлы данных в корне (больше не используются) ---
 networks_history.json
 tracked_ips.json
 users.json
