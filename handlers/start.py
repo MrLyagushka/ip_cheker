@@ -7,8 +7,11 @@ from aiogram import Router
 from aiogram.types import Message
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
-# Импортируем глобальные переменные и утилиту регистрации пользователей
-from config import sem, MAX_CONCURRENT_PINGS, ADMIN_ID, register_user
+# Этап 1: вместо хрупкого `sem._value` (Б13) — публичный API throttle;
+# лимит потоков читаем через модуль config, чтобы видеть актуальное
+# значение после админской смены «на лету» (Б11).
+import config
+from config import throttle, ADMIN_ID, register_user
 
 # Создаем изолированный роутер для модуля старта
 router = Router()
@@ -20,7 +23,8 @@ async def cmd_start(message: Message):
     Шаги выполнения:
     1. register_user(message.from_user.id) — сохраняет ID пользователя в базу данных (users.json),
        чтобы в дальнейшем администратор мог делать по ним массовые рассылки.
-    2. sem._value — считывает текущее количество свободных глобальных потоков из объекта семафора.
+    2. throttle.free — публичное свойство мутируемого ограничителя пингов
+       (Б13: отказ от прямого доступа к приватному полю asyncio.Semaphore).
     3. Формирует красивое HTML-сообщение со всеми актуальными командами (/scan, /tree, /new_ip и т.д.).
     4. Проверяет, равен ли ID пользователя константе ADMIN_ID (1424727277). 
        Если да — добавляет в текст подсказку о доступности панели управления (/admin).
@@ -30,18 +34,19 @@ async def cmd_start(message: Message):
     register_user(message.from_user.id)
     
     # Получаем актуальное количество свободных слотов пинга
-    free_slots = sem._value
+    free_slots = throttle.free
     
     text = (
         "Привет! Бот для пинг-сканирования запущен.\n\n"
-        f"🟢 Свободных глобальных потоков: <b>{free_slots}/{MAX_CONCURRENT_PINGS}</b>\n\n"
+        f"🟢 Свободных глобальных потоков: <b>{free_slots}/{config.throttle.limit}</b>\n\n"
         "<b>Как пользоваться:</b>\n"
         "• Одиночные IP через пробел: <code>/scan 8.8.8.8 1.1.1.1 9.9.9.9</code>\n"
         "• Подсеть x.x.x.0: <code>/scan 66.86.15.0</code>\n"
         "• Дерево сетей: <code>/tree</code>\n"
         "• Мониторинг IP: <code>/new_ip</code>, <code>/get_ip</code>, <code>/remove_ip</code>, <code>/check_ip</code>\n"
         "❌ Подсети вида <code>x.x.0.0</code> не проверяются.\n\n"
-        "ℹ️ <i>Ограничение:</i> 1 активный процесс сканирования на одного пользователя."
+        "ℹ️ <i>Ограничение:</i> 1 активный процесс сканирования/проверки на одного пользователя (фоновый ежечасный мониторинг работает независимо и не блокирует команды).\n\n"
+        "⚠️ <i>Важно про прокси:</i> <code>PROXY_URL</code> влияет только на соединения бота с Telegram API. Пинги (ICMP) при сканировании всегда идут напрямую с сервера, через прокси не проходят."
     )
     
     # Персональная проверка: если пишет администратор, показываем секретную команду

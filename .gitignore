@@ -1,0 +1,43 @@
+# --- Секреты и локальная конфигурация (НИКОГДА не коммитить) ---
+.env
+*.env.local
+.env.*.local
+
+# --- Данные рантайма / конфигурация (каталог DATA_DIR, Этап 7) ---
+data/
+.env
+
+# --- Legacy: старые файлы данных в корне (больше не используются) ---
+networks_history.json
+tracked_ips.json
+users.json
+result.txt
+result_*.txt
+base.txt
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Логи и временные файлы ---
+*.log
+*.tmp
+nohup.out
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Старый архивный код (не коммитить)
+old/
