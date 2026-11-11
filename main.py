@@ -1,6 +1,7 @@
 import asyncio
 from config import dp, bot, init_files
 from handlers import start, scan, tree, admin, monitor
+from handlers.middlewares import UserRegistrationMiddleware
 from handlers.monitor import hourly_monitor_loop
 
 
@@ -23,6 +24,10 @@ async def monitor_supervisor():
 
 async def main():
     init_files()
+    
+    # Этап 5 (Б7): outer-middleware регистрирует пользователя в users.json
+    # на ЛЮБОЙ входящий update (сообщение/колбэк), а не только через /start.
+    dp.update.outer_middleware(UserRegistrationMiddleware())
     
     # Подключаем роутеры
     dp.include_router(start.router)

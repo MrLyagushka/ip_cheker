@@ -188,18 +188,15 @@
 
 ---
 
-## Этап 5. Мониторинг-команды (`handlers/monitor.py`, команды)
+## Этап 5. Мониторинг-команды (`handlers/monitor.py`, команды) — ✅ ВЫПОЛНЕН
 
-1. **Валидация в `/new_ip` (Б4):** использовать `config.is_valid_ip` (диапазон октетов!) вместо ручной проверки `isdigit`.
-2. **Регистрация пользователей везде (Б7):** вызвать `register_user(message.from_user.id)` в обработчиках `/scan`, `/new_ip`, `/check_ip`, `/tree` (или единый глобальный `@dp.message()` outer-middleware/фильтр регистрации — чище: middleware, регистрирующий каждого пишущего боту). Рекомендуемый вариант — **middleware**:
-   ```python
-   @dp.message.register(priority=1)   # outer_middleware / global handler before routers
-   async def auto_register(message: Message): register_user(message.from_user.id)
-   ```
-   (в aiogram 3 — внешний middleware через `dp.update.outer_middleware(...)`).
-3. **Экранирование** IP в ответах (пользовательский ввод в HTML).
-4. `/check_ip`: добавить защиту от `None`-текста, обработку ошибок `edit_text`, и не конфликтовать с фоновым циклом (см. этап 2.5).
-5. Проверка: `/new_ip 256.1.1.1` → отказ; пользователь, никогда не вводивший `/start`, появляется в `users.json` после `/scan`.
+1. **Валидация в `/new_ip` (Б4):** ✅ `config.is_valid_ipv4` (строгая, через `ipaddress`; октеты 0–255, ведущие нули отвергаются) применяется в `cmd_new_ip`; мусорные адреса (`999.1.1.1`, `256.0.0.1`) отклоняются с отдельным сообщением-списком и НЕ попадают в `tracked_ips.json`.
+2. **Регистрация пользователей везде (Б7):** ✅ реализован recommended-вариант — outer-middleware: новый файл `handlers/middlewares.py` (`UserRegistrationMiddleware`, ленивый импорт `config.register_user`, ошибки регистрации глотаются и логируются, события без `from_user` пропускаются). Подключён в `main.py` до диспетчеризации: `dp.update.outer_middleware(UserRegistrationMiddleware())`. Теперь любой входящий update (сообщение/колбэк), а не только `/start`, добавляет пользователя в `users.json` (дедупликация через существующий `register_user`).
+3. **Экранирование** IP в ответах: ✅ уже сделано на этапах 1–3 (invalid_ips в /new_ip через `escape()`, цели в scan/check_ip/tree экранированы).
+4. `/check_ip`: ✅ защита и обработка ошибок выполнены на этапе 2 (ping_many + try/except + escape); конфликт с фоновым циклом устранён (этап 2, Б22).
+5. Проверка: ✅ тесты (мок aiogram-объектов): `/new_ip 8.8.8.8 999.1.1.1 1.1.1.1 256.0.0.1 9.9.9.9` → сохранены только 3 валидных, отказ по мусору; пользователь 393965856 (не вводивший /start) появляется в `users.json` после первого же `/scan`-сообщения через middleware; повторная регистрация не дублирует; событие без from_user не падает; исключение внутри register_user не роняет обработку. py_compile всех модулей OK.
+
+---
 
 ---
 
