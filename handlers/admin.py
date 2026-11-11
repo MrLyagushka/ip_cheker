@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import logging
 from aiogram import Bot, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
@@ -16,6 +17,8 @@ from config import (
     ADMIN_ID, HISTORY_FILE, TRACKED_IPS_FILE,
     USERS_FILE, save_env_value, bot, throttle,
 )
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -252,7 +255,7 @@ async def process_new_proxy(message: Message, state: FSMContext):
             # соединений). Прежний «синхронный force_close» убран.
             await old_session.close()
         except Exception as e:
-            print(f"[admin] Не удалось закрыть старую сессию: {e!r}")
+            logger.warning("Не удалось закрыть старую сессию: %r", e)
     await state.clear()
 
     status_text = f"<b>{config.PROXY_URL}</b>" if config.PROXY_URL else "отключен (прямое соединение)"

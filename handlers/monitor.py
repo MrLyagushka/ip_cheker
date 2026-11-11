@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import logging
 from html import escape
 from aiogram import Router
 # В aiogram 3.15+ класс переименован из TelegramForbiddenException в TelegramForbiddenError;
@@ -17,6 +18,8 @@ from config import (
     TRACKED_IPS_FILE, active_users, bot,
     ALERT_CHAT_ID, ALERT_THREAD_ID, is_valid_ipv4, ping_many,
 )
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -208,7 +211,7 @@ async def cmd_check_ip(message: Message):
 
         await status_msg.edit_text("\n".join(report_lines), parse_mode="HTML")
     except Exception as e:
-        print(f"Ошибка внеплановой проверки для {user_id}: {e}")
+        logger.exception("Ошибка внеплановой проверки для %s", user_id)
         try:
             await status_msg.edit_text("❌ <b>Проверка завершилась с ошибкой.</b>", parse_mode="HTML")
         except Exception:
@@ -226,7 +229,7 @@ async def _check_user_ips(user_id_str: str, ips: list[str]) -> dict:
     try:
         res = await ping_many(list(ips))
     except Exception as e:
-        print(f"Ошибка пинг-пакета для пользователя {user_id_str}: {e}")
+        logger.exception("Ошибка пинг-пакета для пользователя %s", user_id_str)
         res = {ip: False for ip in ips}
     return {"user_id": int(user_id_str), "results": [(ip, alive) for ip, alive in res.items()]}
 
@@ -273,7 +276,7 @@ async def hourly_monitor_tick():
 
     for outcome in outcomes:
         if isinstance(outcome, Exception):
-            print(f"Пропущен пользователь из-за ошибки опроса: {outcome}")
+            logger.error("Пропущен пользователь из-за ошибки опроса: %r", outcome)
             continue
 
         user_id = outcome["user_id"]
@@ -286,9 +289,9 @@ async def hourly_monitor_tick():
         except TelegramForbiddenException:
             # Пользователь заблокировал бота — отчёт не доставлен, но алерт
             # в групповой чат всё равно уходит (серверы-то лежат).
-            print(f"Пользователь {user_id} заблокировал бота — автоотчёт пропущен.")
+            logger.info("Пользователь %s заблокировал бота — автоотчёт пропущен.", user_id)
         except Exception as e:
-            print(f"Не удалось отправить автоотчет пользователю {user_id}: {e}")
+            logger.warning("Не удалось отправить автоотчет пользователю %s: %r", user_id, e)
 
         # 2. Аварийное уведомление в групповой чат с тегом владельца (Б1).
         if ALERT_CHAT_ID and dead_ips:
@@ -300,7 +303,7 @@ async def hourly_monitor_tick():
                     message_thread_id=ALERT_THREAD_ID,
                 )
             except Exception as e:
-                print(f"Не удалось отправить алерт в чат {ALERT_CHAT_ID}: {e}")
+                logger.warning("Не удалось отправить алерт в чат %s: %r", ALERT_CHAT_ID, e)
 
 
 async def hourly_monitor_loop():
@@ -313,4 +316,4 @@ async def hourly_monitor_loop():
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"Ошибка прохода ежечасного мониторинга (продолжаем): {e}")
+            logger.exception("Ошибка прохода ежечасного мониторинга (продолжаем)")

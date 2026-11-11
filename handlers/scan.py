@@ -13,6 +13,7 @@
 """
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime
 from html import escape
@@ -29,6 +30,8 @@ from config import (
     active_users, init_files, HISTORY_FILE,
     async_ping_ip, classify_targets, result_path_for,
 )
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -212,7 +215,7 @@ async def cmd_scan(message: Message, command: CommandObject):
         try:
             save_to_history(history_entries)
         except Exception as e:
-            print(f"Ошибка сохранения истории для {user_id}: {e}")
+            logger.exception("Ошибка сохранения истории для %s", user_id)
 
         alive_count = sum(1 for _, alive in results_list if alive)
         dead_count = total_ips - alive_count
@@ -271,7 +274,7 @@ async def cmd_scan(message: Message, command: CommandObject):
             await message.answer("⚠️ Файл результатов пуст.")
 
     except Exception as e:
-        print(f"Ошибка сканирования для {user_id}: {e!r}")
+        logger.exception("Ошибка сканирования для %s", user_id)
         try:
             await message.answer("❌ <b>Сканирование завершилось с ошибкой.</b>", parse_mode="HTML")
         except Exception:

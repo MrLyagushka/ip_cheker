@@ -8,8 +8,13 @@
 `from_user` регистрируется автоматически, до диспетчеризации по роутерам.
 """
 
+import logging
+
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
+
+
+logger = logging.getLogger(__name__)
 
 
 class UserRegistrationMiddleware(BaseMiddleware):
@@ -24,5 +29,5 @@ class UserRegistrationMiddleware(BaseMiddleware):
             try:
                 config.register_user(user.id)
             except Exception as e:  # регистрация не должна ронять обработку
-                print(f"UserRegistrationMiddleware: register_user failed: {e!r}")
+                logger.warning("register_user failed: %r", e)
         return await handler(event, data)

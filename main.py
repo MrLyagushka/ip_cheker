@@ -1,5 +1,7 @@
 import asyncio
-from config import dp, bot, init_files
+import logging
+
+from config import dp, bot, init_files, setup_logging
 from handlers import start, scan, tree, admin, monitor
 from handlers.middlewares import UserRegistrationMiddleware
 from handlers.monitor import hourly_monitor_loop
@@ -18,11 +20,15 @@ async def monitor_supervisor():
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"Монитор упал: {e!r}. Перезапуск через 60 секунд...")
+            logger.exception("Монитор упал (%r). Перезапуск через 60 секунд...", e)
             await asyncio.sleep(60)
 
 
+logger = logging.getLogger("main")
+
+
 async def main():
+    setup_logging()  # LOG_LEVEL из .env, если задан
     init_files()
     
     # Этап 5 (Б7): outer-middleware регистрирует пользователя в users.json
@@ -39,7 +45,7 @@ async def main():
     # Запуск фоновой задачи ежечасного мониторинга под supervisor'ом
     asyncio.create_task(monitor_supervisor())
     
-    print("Бот успешно запущен и ожидает команды...")
+    logger.info("Бот успешно запущен и ожидает команды...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
