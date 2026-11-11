@@ -1,0 +1,26 @@
+# Секреты: .env НЕ копируется в образ (пробрасывается через docker-compose env_file)
+.env
+.env.*
+!.env.example
+
+# Git и артефакты сборки
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Данные рантайма (монтируются томом, не должны "печаться" в образ)
+networks_history.json
+tracked_ips.json
+users.json
+result.txt
+result_*.txt
+base.txt
+*.log
+
+# Старый код и документация
+old/
+FIX_PLAN.md
+README.md
+.dockerignore

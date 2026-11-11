@@ -6,7 +6,10 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir aiogram aiohttp-socks
 
-# Копируем всю структуру проекта
-COPY . /app/
+# Секреты и данные не печатаются в образ — см. .dockerignore;
+# .env пробрасывается через docker-compose (env_file), данные — через volumes
+COPY *.py /app/
+COPY handlers/ /app/handlers/
+COPY .env.example /app/
 
 CMD ["python3", "main.py"]
