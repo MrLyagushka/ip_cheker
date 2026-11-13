@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import base64
 import ipaddress
 import json
 import logging
@@ -565,3 +566,101 @@ def register_user(user_id: int, users_file=None):
         users.append(user_id)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(users, f, ensure_ascii=False, indent=4)
+
+
+# ─────────────── tracked_ips.json + кнопка «🧹 Убрать неактивные ip» ─────────
+
+# Фича 2: inline-кнопка очистки мёртвых IP из мониторинга. callback_data в
+# Telegram ограничен 64 байтами, поэтому dead-IP кодируются компактно: каждый
+# IPv4 — 4 байта, base64url без паддинга. Префикс зарезервирован под другие
+# колбэки, чтобы хендлер фильтровал «свои» данные.
+CLEANUP_CB_PREFIX = "c:"
+# 64 байта — жёсткий лимит callback_data. Префикс 'c:' (2) + base64url без
+# паддинга: ceil(4N/3). При N=15 выходит ровно 64 — берём на один меньше,
+# чтобы гарантированно быть СТРОГО меньше лимита.
+DEAD_IPS_MAX = 14
+
+
+def load_tracked_ips(path=None) -> dict:
+    """Чтение tracked_ips.json {uid_str: [ip,...]}; повреждённый файл → {}."""
+    p = path or TRACKED_IPS_FILE
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Не удалось прочитать %s — считаем список пустым", p)
+        return {}
+
+
+def save_tracked_ips(data: dict, path=None) -> None:
+    """Атомарная запись tracked_ips.json (temp + replace, как save_env_value)."""
+    p = path or TRACKED_IPS_FILE
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    os.replace(tmp, p)
+
+
+def encode_dead_payload(dead_ips) -> str:
+    """Список dead-IPv4 → base64url-строка без паддинга ('' если пусто/нет лимита).
+
+    Каждый адрес упакован в 4 байта; итог вместе с CLEANUP_CB_PREFIX должен
+    гарантированно вписываться в лимит callback_data (64 байта ASCII), поэтому
+    список предварительно дедуплицируется с сохранением порядка и режется до
+    DEAD_IPS_MAX записей. Невалидные адреса пропускаются, а не роняют кнопку.
+    """
+    seen: set[str] = set()
+    packed = bytearray()
+    for ip in dead_ips:
+        s = str(ip).strip()
+        if s in seen or not is_valid_ipv4(s):
+            continue
+        seen.add(s)
+        packed += ipaddress.IPv4Address(s).packed
+        if len(seen) >= DEAD_IPS_MAX:
+            break
+    if not seen:
+        return ""
+    return base64.urlsafe_b64encode(bytes(packed)).decode("ascii").rstrip("=")
+
+
+def decode_dead_payload(payload: str) -> list[str]:
+    """Обратная операция к encode_dead_payload; битый payload → []."""
+    if not payload:
+        return []
+    try:
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    except Exception:
+        logger.warning("Битый callback payload: %r", payload)
+        return []
+    if len(raw) % 4:
+        return []
+    return [str(ipaddress.IPv4Address(raw[i:i + 4])) for i in range(0, len(raw), 4)]
+
+
+def remove_dead_ips(user_id, dead_ips, path=None) -> tuple[list[str], list[str]]:
+    """Идемпотентное удаление dead-IP из мониторинга пользователя (фича 2).
+
+    Удаляются ТОЛЬКО адреса, реально присутствующие в списке этого юзера:
+    повторный нажатый колбэк ничего не ломает, чужие списки не затрагиваются
+    (ключ — строго str(user_id) нажимающего). Пустой список после удаления
+    оставляем как [] — структура tracked_ips.json не меняется.
+
+    Возвращает (removed, skipped): фактически удалённые и пропущенные адреса.
+    """
+    data = load_tracked_ips(path)
+    key = str(user_id)
+    user_ips = data.get(key, [])
+    if not isinstance(user_ips, list):
+        user_ips = []
+    to_remove = {str(ip).strip() for ip in dead_ips}
+    removed = [ip for ip in user_ips if ip in to_remove]
+    kept = [ip for ip in user_ips if ip not in to_remove]
+    skipped = sorted(to_remove - set(removed))
+    if removed:
+        data[key] = kept
+        save_tracked_ips(data, path)
+    return removed, skipped

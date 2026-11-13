@@ -35,6 +35,8 @@ from config_core import (  # noqa: F401
     active_users, build_session, init_files, async_ping_ip, ping_many,
     is_valid_ipv4, expand_targets, classify_targets, save_to_history,
     build_tree_blocks, format_monitor_report, format_alert, register_user,
+    CLEANUP_CB_PREFIX, DEAD_IPS_MAX, load_tracked_ips, save_tracked_ips,
+    encode_dead_payload, decode_dead_payload, remove_dead_ips,
 )
 
 

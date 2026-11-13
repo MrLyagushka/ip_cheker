@@ -9,7 +9,10 @@
 - Б9/Б3 — история с типами записей subnet/host вместо псевдо-подсетей из
   одиночных IP; запрещённые x.x.0.0 не попадают в историю ни одним путём;
   добавлены scanned_by и ограничение размера истории;
-- Б6 — флаг активности через ActiveUserRegistry (stale-очистка зависших записей).
+- Б6 — флаг активности через ActiveUserRegistry (stale-очистка зависших записей);
+- Б25 — доставка финального отчёта через safe_send/safe_edit (ретрай по
+  TelegramRetryAfter): раньше необработанный flood-wait «останавливал»
+  сканирование и глотался внешним except Exception.
 """
 import asyncio
 import json
@@ -19,9 +22,11 @@ from datetime import datetime
 from html import escape
 
 from aiogram import Router
-from aiogram.types import Message, FSInputFile
+from aiogram.types import (
+    Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 from aiogram.filters import Command, CommandObject
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 # Этап 1: единый пинг/валидация из config (Б19, Б4); throttle — мутируемый
 # семафор, админский лимит действует на этот модуль мгновенно (Б11).
@@ -30,6 +35,18 @@ from config import (
     active_users, init_files, HISTORY_FILE,
     async_ping_ip, classify_targets, result_path_for,
 )
+# Б25: flood-safe доставка (retry по e.retry_after + pacing массовых отправок).
+from delivery import safe_send, safe_edit, pace
+# Фича 2: компактное кодирование dead-IP в callback_data (<64 байт),
+# идемпотентное удаление из tracked_ips.json.
+from config_core import (
+    encode_dead_payload, decode_dead_payload, remove_dead_ips,
+    CLEANUP_CB_PREFIX,
+)
+# Единый источник клавиатуры «🧹» и колбэк-хендлера — в monitor.py (кнопка
+# нужна и под /check_ip, и под автоотчётом). Импорт после определения
+# локального build_cleanup_kb = None см. ниже (циклических зависимостей нет:
+# monitor не импортирует scan).
 
 logger = logging.getLogger(__name__)
 
@@ -68,15 +85,89 @@ def save_to_history(entries: list[dict]):
         json.dump(history, f, ensure_ascii=False, indent=4)
 
 
-async def _safe_edit(message: Message, text: str) -> bool:
-    """edit_text с защитой от flood-control/прочих ошибок Telegram (Б17)."""
-    try:
-        await message.edit_text(text, parse_mode="HTML")
-        return True
-    except TelegramAPIError:
-        return False
-    except Exception:
-        return False
+async def _safe_edit(message: Message, text: str, reply_markup=None) -> bool:
+    """edit_text с ретраем по flood-control (Б17, Б25) — обёртка над safe_edit.
+
+    Б25: при TelegramRetryAfter пауза берётся из e.retry_after (+0.5 сек) и
+    делается повтор; каппится 5 секундами — это интерактивный троттлируемый
+    прогресс (~1 Гц), долго ждать в нём бессмысленно, следующий тик всё равно
+    через секунду. «message is not modified» считается успехом. Возвращает
+    False только когда редактирование реально недоступно — вызывающий код
+    уходит на fallback (новое сообщение).
+    """
+    return await safe_edit(message, text, reply_markup=reply_markup,
+                           max_attempts=2, max_total_wait=6.0, cap=5.0)
+
+
+# ─────────────────────── Статусы и кнопки (фичи 1–2, Б25) ────────────────────
+
+# Секция «Статусы» выводится только для одиночных целей: подсеть — это 256
+# строк, они гарантированно пробивают лимит 4096 символов и бесполезны в чате
+# (полный список есть в result.txt).
+STATUS_SECTION_MAX_HOSTS = 30
+TELEGRAM_MESSAGE_LIMIT = 4096
+TRUNCATION_HINT = "📎 Полный список статусов — в файле result.txt"
+
+
+def build_status_section(results_list: list[tuple[str, bool]],
+                         header: str = "Статусы") -> str:
+    """Секция «🟢/🔴 напротив каждого хоста» (фича 1). Пустая строка для подсетей.
+
+    Подсеть (более STATUS_SECTION_MAX_HOSTS целей) не расписывается вообще:
+    256 строк в чат не помещаются, а частичный список вводит в заблуждение.
+    Каждый адрес проходит html.escape (Б17-паттерн) — цели приходят от
+    пользователя и не должны ломать разметку сообщения.
+    """
+    if not results_list or len(results_list) > STATUS_SECTION_MAX_HOSTS:
+        return ""
+    lines = [f"📋 <b>{header}:</b>", ""]
+    for ip, alive in results_list:
+        icon = "🟢" if alive else "🔴"
+        lines.append(f"{icon} <code>{escape(str(ip))}</code>")
+    return "\n".join(lines)
+
+
+def fit_with_status(final_message: str, status_section: str) -> tuple[str, str]:
+    """Упаковка финального текста + секции статусов в лимит 4096 символов.
+
+    Возвращает (текст_сообщения, примечание_об_урезке): если секция не влезает,
+    она усекается по целым строкам и добавляется отсылка к result.txt
+    (примечание вызывающий код дописывает отдельным сообщением, чтобы точно
+    не пробить лимит).
+    """
+    if not status_section:
+        return final_message, ""
+    candidate = final_message + "\n\n" + status_section
+    if len(candidate) <= TELEGRAM_MESSAGE_LIMIT:
+        return candidate, ""
+    budget = (TELEGRAM_MESSAGE_LIMIT - len(final_message) - 2
+              - len(TRUNCATION_HINT) - 2)  # \n… перед хинтом
+    kept: list[str] = []
+    size = 0
+    for line in status_section.split("\n"):
+        add = len(line) + (1 if kept else 0)
+        if size + add > max(budget, 0):
+            break
+        kept.append(line)
+        size += add
+    note = ("⚠️ Список статусов усечён из-за лимита Telegram (4096 символов). "
+            + TRUNCATION_HINT)
+    if kept:
+        text = final_message + "\n\n" + "\n".join(kept) + "\n…"
+        return text, note
+    # Даже одна строка не влезла — отправляем отчёт без секции.
+    return final_message, note
+
+
+def build_cleanup_kb(dead_ips: list[str]) -> InlineKeyboardMarkup | None:
+    """Inline-клавиатура «🧹 Убрать неактивные ip» (фича 2).
+
+    None — если мёртвых адресов нет или ни один не кодируется в payload.
+    Компактное кодирование dead-IP в callback_data (<64 байт) и идемпотентное
+    удаление — в config_core; хендлер колбэка — в handlers/monitor.py.
+    """
+    from handlers.monitor import build_cleanup_kb as _shared_build_kb
+    return _shared_build_kb(dead_ips)
 
 
 @router.message(Command("scan"))
@@ -183,6 +274,14 @@ async def cmd_scan(message: Message, command: CommandObject):
                     f"\n<code>{ratio_bar}</code>\n"
                     f"🟢 Доступно: <code>{alive_so_far}</code> | 🔴 Недоступно: <code>{dead_so_far}</code>"
                 )
+                # Фича 1: для одиночных адресов под индикаторами — живая
+                # секция «Статусы» (🟢/🔴 напротив каждого хоста в порядке
+                # ввода). Для подсетей (256 строк) секция не выводится.
+                if total_ips <= STATUS_SECTION_MAX_HOSTS:
+                    partial = [(ip, results_map[ip]) for ip in all_ips
+                               if ip in results_map]
+                    section = build_status_section(partial, header="Статусы")
+                    progress_text, _ = fit_with_status(progress_text, section)
                 await _safe_edit(status_msg, progress_text)
         finally:
             for t in pending:
@@ -228,24 +327,34 @@ async def cmd_scan(message: Message, command: CommandObject):
 
         # Пер-юзерский файл отчёта — параллельные сканы разных пользователей
         # больше не перехватывают отчёт друг друга (Б18).
+        # Б25: запись результатов отделена от доставки — сбой диска не должен
+        # «съедать» текстовый отчёт в чате, а flood-контроль — обрывать запись.
         user_result_file = result_path_for(user_id)
-        with open(user_result_file, "w", encoding="utf-8") as rf:
-            rf.write("==================================================\n")
-            rf.write("             АНАЛИТИКА ПИНГ-СКАНИРОВАНИЯ          \n")
-            rf.write("==================================================\n")
-            rf.write(f"Цели сканирования:      {display_target}\n")
-            rf.write(f"Дата и время проверки:  {scan_time}\n")
-            rf.write(f"Всего проверено IP:     {total_ips}\n")
-            rf.write(f"Доступно (Online - 'y'): {alive_count}\n")
-            rf.write(f"Недоступно (Offline-'n'): {dead_count}\n")
-            rf.write(f"Процент доступности:    {availability_percent:.2f}%\n")
-            rf.write("--------------------------------------------------\n")
-            rf.write("ДЕТАЛЬНЫЙ СТАТУС ПО АДРЕСАМ:\n")
-            rf.write("--------------------------------------------------\n")
-            for target_ip, alive in results_list:
-                res_char = 'y' if alive else 'n'
-                rf.write(f"{target_ip} -> {res_char}\n")
-            rf.write("==================================================\n")
+        try:
+            with open(user_result_file, "w", encoding="utf-8") as rf:
+                rf.write("==================================================\n")
+                rf.write("             АНАЛИТИКА ПИНГ-СКАНИРОВАНИЯ          \n")
+                rf.write("==================================================\n")
+                rf.write(f"Цели сканирования:      {display_target}\n")
+                rf.write(f"Дата и время проверки:  {scan_time}\n")
+                rf.write(f"Всего проверено IP:     {total_ips}\n")
+                rf.write(f"Доступно (Online - 'y'): {alive_count}\n")
+                rf.write(f"Недоступно (Offline-'n'): {dead_count}\n")
+                rf.write(f"Процент доступности:    {availability_percent:.2f}%\n")
+                rf.write("--------------------------------------------------\n")
+                rf.write("ДЕТАЛЬНЫЙ СТАТУС ПО АДРЕСАМ:\n")
+                rf.write("--------------------------------------------------\n")
+                for target_ip, alive in results_list:
+                    res_char = 'y' if alive else 'n'
+                    rf.write(f"{target_ip} -> {res_char}\n")
+                rf.write("==================================================\n")
+        except OSError as e:
+            logger.exception("Не удалось записать %s для %s", user_result_file, user_id)
+            await safe_send(
+                message.answer,
+                f"⚠️ Не удалось сохранить файл отчёта ({escape(str(e))}) — "
+                "ниже только сводка в чате.", parse_mode="HTML",
+            )
 
         final_message = (
             f"📊 <b>Отчет сканирования:</b> <code>{safe_display}</code>\n"
@@ -259,19 +368,48 @@ async def cmd_scan(message: Message, command: CommandObject):
             f"\n<code>{ratio_bar}</code>"
         )
 
-        # Б17: если редактирование недоступно (flood/старое сообщение) —
-        # дублируем финальный результат новым сообщением.
-        if not await _safe_edit(status_msg, final_message):
-            await message.answer(final_message, parse_mode="HTML")
+        # ── Финальный отчёт ───────────────────────────────────────────────
+        # Б25: доставка и запись результатов разнесены по разным try/except.
+        # Раньше TelegramRetryAfter из message.answer() глотался внешним
+        # except Exception — пользователь видел «Сканирование завершилось с
+        # ошибкой», хотя все пины прошли успешно. Теперь ошибка доставки не
+        # может «уронить» отчёт: она логируется, а результат всё равно
+        # сохраняется и пересылается.
+        dead_ips = [ip for ip, alive in results_list if not alive]
+        # Фича 1: секция статусов только для одиночных адресов; фича 2:
+        # кнопка «🧹 Убрать неактивные ip» под финальным сообщением.
+        status_section = build_status_section(results_list)
+        final_text, trunc_note = fit_with_status(final_message, status_section)
+        cleanup_kb = build_cleanup_kb(dead_ips)
+
+        delivered = await _safe_edit(status_msg, final_text, reply_markup=cleanup_kb)
+        if not delivered:
+            # Б17: редактирование недоступно (flood/старое сообщение) —
+            # дублируем финальный результат новым сообщением (safe_send с
+            # ретраем по retry_after вместо голого message.answer).
+            delivered = await safe_send(
+                message.answer, final_text, parse_mode="HTML",
+                reply_markup=cleanup_kb,
+            ) is not None
+        if not delivered:
+            logger.warning("Финальный отчёт для %s не доставлен (flood)", user_id)
+        if trunc_note:
+            # Примечание об усечении — отдельным коротким сообщением, чтобы
+            # гарантированно не пробить лимит 4096 символов.
+            await pace()
+            await safe_send(message.answer, f"ℹ️ {trunc_note}", parse_mode="HTML")
 
         if user_result_file.exists() and user_result_file.stat().st_size > 0:
+            await pace()  # Б25: текст+документ в один чат — выдерживаем ~1 msg/sec
             file = FSInputFile(str(user_result_file), filename="result.txt")
-            await message.answer_document(
-                file,
+            sent_doc = await safe_send(
+                message.answer_document, file,
                 caption=f"📁 Полный отчет аналитики для {escape(' '.join(raw_args))}",
             )
+            if sent_doc is None:
+                await safe_send(message.answer, "⚠️ Не удалось отправить файл отчёта.")
         else:
-            await message.answer("⚠️ Файл результатов пуст.")
+            await safe_send(message.answer, "⚠️ Файл результатов пуст.", parse_mode="HTML")
 
     except Exception as e:
         logger.exception("Ошибка сканирования для %s", user_id)
