@@ -10,31 +10,94 @@ try:
     from aiogram.exceptions import TelegramForbiddenError as TelegramForbiddenException
 except ImportError:  # pragma: no cover - старые версии aiogram 3.x
     from aiogram.exceptions import TelegramForbiddenException
-from aiogram.types import Message
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+)
 from aiogram.filters import Command, CommandObject
 # Этап 1: единая строгая валидация IPv4 из config (Б4).
 # Этап 2: параллельный опрос через ping_many (Б10), crash-guard цикла.
 from config import (
     TRACKED_IPS_FILE, active_users, bot,
     ALERT_CHAT_ID, ALERT_THREAD_ID, is_valid_ipv4, ping_many,
+    load_tracked_ips, save_tracked_ips,
+    encode_dead_payload, decode_dead_payload, remove_dead_ips,
+    CLEANUP_CB_PREFIX,
 )
+# Б25: flood-safe доставка для фоновых тиков и массовых рассылок.
+from delivery import safe_send, safe_edit, pace
 
 logger = logging.getLogger(__name__)
 
 router = Router()
 
-def load_tracked_ips():
-    if os.path.exists(TRACKED_IPS_FILE):
-        try:
-            with open(TRACKED_IPS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
 
-def save_tracked_ips(data):
-    with open(TRACKED_IPS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+# ───────────── Кнопка «🧹 Убрать неактивные ip» + callback-хендлер ───────────
+
+def build_cleanup_kb(dead_ips: list[str]) -> InlineKeyboardMarkup | None:
+    """Inline-клавиатура «🧹 Убрать неактивные ip» (фича 2).
+
+    None — если мёртвых адресов нет или ни один не кодируется в payload.
+    Компактное кодирование (<64 байт, см. config_core.encode_dead_payload):
+    каждый IPv4 → 4 байта, base64url без паддинга, префикс CLEANUP_CB_PREFIX.
+    Ставится под финальные сообщения /scan, /check_ip и ежечасного автоотчёта;
+    под групповые алерты НЕ ставится (алерт видит вся группа, а удалять список
+    будет тот, кто нажал).
+    """
+    payload = encode_dead_payload(dead_ips)
+    if not payload:
+        return None
+    # Счётчик в тексте — по реально кодируемым адресам (payload обрезается до
+    # DEAD_IPS_MAX, кнопка не должна обещать больше, чем удалит).
+    encoded = decode_dead_payload(payload)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"🧹 Убрать неактивные ip ({len(encoded)})",
+            callback_data=CLEANUP_CB_PREFIX + payload,
+        )
+    ]])
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith(CLEANUP_CB_PREFIX))
+async def cb_cleanup_dead_ips(callback: CallbackQuery):
+    """Обработка нажатия «🧹 Убрать неактивные ip» (фича 2).
+
+    * callback.answer() вызывается ОБЯЗАТЕЛЬНО на всех ветках (в т.ч. при
+      ошибке) — иначе у клиента крутится часовой индикатор ожидания;
+    * удаление идемпотентно и только по адресам нажимающего пользователя
+      (config_core.remove_dead_ips): повторный тап ничего не ломает, чужие
+      списки не затрагиваются;
+    * после обработки клавиатура снимается (edit_reply_markup); если текст
+      итогового сообщения недоступен правке (старое/служебное) — это не беда.
+    """
+    try:
+        dead = decode_dead_payload(callback.data[len(CLEANUP_CB_PREFIX):])
+        if not dead:
+            await callback.answer("⚠️ Список не распознан — обновите данные командой /get_ip",
+                                  show_alert=True)
+            return
+        removed, skipped = remove_dead_ips(callback.from_user.id, dead)
+        if removed:
+            note = f"🧹 Убрано из мониторинга: {len(removed)} шт."
+            if skipped:
+                note += f" (уже отсутствовали: {len(skipped)})"
+        else:
+            note = "ℹ️ Эти IP уже не состоят в вашем мониторинге."
+        # Идемпотентность подтверждается текущим размером списка юзера.
+        remaining = len(load_tracked_ips().get(str(callback.from_user.id), []))
+        note += f" Всего в мониторинге: {remaining}."
+        # Клавиатуру снимаем всегда (иначе повторный тап удалит то, что
+        # пользователь добавил обратно руками).
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass  # сообщение слишком старое/не редактируется — не критично
+        await callback.answer(note)
+    except Exception as e:  # noqa: BLE001 — answer обязателен на любой ветке
+        logger.exception("Ошибка обработки callback очистки IP")
+        try:
+            await callback.answer("❌ Ошибка обработки, попробуйте позже", show_alert=True)
+        except Exception:
+            pass
 
 @router.message(Command("new_ip"))
 async def cmd_new_ip(message: Message, command: CommandObject):
@@ -209,7 +272,12 @@ async def cmd_check_ip(message: Message):
 
         report_lines.append(f"\n🟢 Доступно: <b>{alive_count}</b> | 🔴 Недоступно: <b>{dead_count}</b>")
 
-        await status_msg.edit_text("\n".join(report_lines), parse_mode="HTML")
+        # Фича 2: кнопка «🧹 Убрать неактивные ip» под финальным отчётом.
+        kb = build_cleanup_kb([ip for ip, alive in results if not alive])
+        # Б25: edit с ретраем по RetryAfter; fallback — новое сообщение.
+        if not await safe_edit(status_msg, "\n".join(report_lines), reply_markup=kb):
+            await safe_send(message.answer, "\n".join(report_lines),
+                            parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.exception("Ошибка внеплановой проверки для %s", user_id)
         try:
@@ -284,23 +352,43 @@ async def hourly_monitor_tick():
         dead_ips = [ip for ip, alive in results if not alive]
 
         # 1. Персональный отчёт в личку. Различаем блокировку бота и прочие ошибки.
+        # Фича 2: под автоотчётом — кнопка «🧹 Убрать неактивные ip».
+        # Б25: safe_send c ретраем по RetryAfter; cap=300 — фоновый тик не
+        # должен блокироваться длинными паузами (лимит Telegram ~1 msg/sec на
+        # чат здесь не актуален: лички разные, но общий лимит 30 msg/sec есть).
+        kb = build_cleanup_kb(dead_ips)
         try:
-            await bot.send_message(user_id, _format_report(results), parse_mode="HTML")
-        except TelegramForbiddenException:
-            # Пользователь заблокировал бота — отчёт не доставлен, но алерт
-            # в групповой чат всё равно уходит (серверы-то лежат).
-            logger.info("Пользователь %s заблокировал бота — автоотчёт пропущен.", user_id)
+            # safe_send сам перехватывает TelegramRetryAfter/прочие
+            # TelegramAPIError и возвращает None; TelegramForbiddenError
+            # (юзер заблокировал бота) — подкласс TelegramAPIError, поэтому
+            # проверяем результат и различаем причину по типу последней ошибки.
+            sent = await safe_send(
+                bot.send_message, user_id, _format_report(results),
+                parse_mode="HTML", reply_markup=kb, cap=300.0,
+            )
+            if sent is None:
+                logger.info("Автоотчёт пользователю %s не доставлен "
+                            "(блокировка/flood) — алерт в чат всё равно уйдёт.",
+                            user_id)
         except Exception as e:
             logger.warning("Не удалось отправить автоотчет пользователю %s: %r", user_id, e)
 
         # 2. Аварийное уведомление в групповой чат с тегом владельца (Б1).
+        # КНОПКУ «🧹» НЕ ставим: алерт видят все участники группы, а удаление
+        # списков привязано к нажимающему (иначе любой участник мог бы давить
+        # чужие кнопки). Б25: группа ~300 юзеров + мониторинг пробивают лимит
+        # ~1 msg/sec на чат — поэтому pacing между рассылками и ретрай по
+        # retry_after с капом 300 сек (фоновый тик не должен ждать вечно).
         if ALERT_CHAT_ID and dead_ips:
+            await pace()
             try:
-                await bot.send_message(
+                await safe_send(
+                    bot.send_message,
                     chat_id=ALERT_CHAT_ID,
                     text=_format_alert(user_id, dead_ips),
                     parse_mode="HTML",
                     message_thread_id=ALERT_THREAD_ID,
+                    cap=300.0,
                 )
             except Exception as e:
                 logger.warning("Не удалось отправить алерт в чат %s: %r", ALERT_CHAT_ID, e)
