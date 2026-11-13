@@ -45,27 +45,27 @@ def isolated_env(tmp_path_factory):
     # config.py при импорте вызывает load_env(); если в рабочем каталоге
     # лежит настоящий .env (с боевым TOKEN/ALERT_CHAT_ID), он перетирает
     # тестовые переменные окружения и ломает изоляцию (Б20-тест видел
-    # реальный ALERT_CHAT_ID). Временная заглушка ENV_FILE на время импорта
-    # гарантирует, что читаётся только тестовый .env из tmp_path.
-    real_env = os.environ.get("ENV_FILE")
-    # ВАЖНО: config_core читает ENV_FILE один раз при импорте в модульную
-    # константу, поэтому патчим её тоже — иначе load_env() внутри config.py
-    # прочитает настоящий боевой .env из каталога проекта (реальный
-    # ALERT_CHAT_ID/TOKEN) и изоляция тестов сломается.
+    # реальный ALERT_CHAT_ID).
+    #
+    # КЛЮЧЕВОЙ МОМЕНТ ИЗОЛЯЦИИ: load_env()/iter_env_pairs() берут путь из
+    # ГЛОБАЛЬНОЙ config_core.ENV_FILE (которая вычисляется из os.environ
+    # один раз при импорте модуля — уже ПОСЛЕ того, как aiogram-плагины
+    # могли прогреть config через боевой .env). Поэтому недостаточно
+    # поставить os.environ["ENV_FILE"] — нужно патчить саму константу
+    # _cc.ENV_FILE И запрещать config_core перечитать боевой .env.
+    # Финальный прогон load_env(str(env)) ЯВНО перезаписывает os.environ
+    # значениями из тестового .env, поэтому даже если config был импортирован
+    # раньше фикстуры — после неё все переменные соответствуют tmp_path.
     import config_core as _cc
     _cc.ENV_FILE = str(env)
     os.environ["ENV_FILE"] = str(env)
     try:
         import config  # noqa: F401 — прогрев с тестовым .env
     finally:
-        if real_env is not None:
-            os.environ["ENV_FILE"] = real_env
-    # load_env() внутри config.py перечитал тестовый .env в os.environ —
-    # убираем его обратно, чтобы боевые/тестовые значения не смешивались
-    # при повторных импортах в других сессиях.
-    for var in ("TOKEN", "PROXY_URL", "MAX_CONCURRENT_PINGS", "ADMIN_ID",
-                "ALERT_CHAT_ID", "ALERT_THREAD_ID"):
-        os.environ.pop(var, None)
+        pass
+    # Гарантируем финальное состояние: перечитываем ТОЛЬКО тестовый .env
+    # (боевой больше не трогаем — _cc.ENV_FILE уже указывает на tmp_path).
+    _cc.load_env(str(env))
     yield {"data": data, "env": env}
 
 
