@@ -1,4 +1,9 @@
-"""Форматирование отчётов мониторинга + интеграция monitor-пакета с моками."""
+"""Форматирование отчётов мониторинга + интеграция monitor-пакета с моками.
+
+Обновлено под текущую архитектуру: monitor импортирует пингующие функции из
+config (локальное имя `ping_many`), файлы данных читаются через
+config_core.load_tracked_ips, доставка — через delivery.safe_send.
+"""
 import asyncio
 import json
 
@@ -19,19 +24,17 @@ def test_alert_escapes_and_mentions():
     assert "&lt;bad&gt;" in text and "tg://user?id=42" in text
 
 
-async def test_hourly_package_error_not_silent(tmp_path, monkeypatch):
-    """Б5: ошибка опроса юзера НЕ проглатывается молча — outcome попадает в errors."""
-    users = tmp_path / "users.json"
-    users.write_text("[7]")
+async def test_hourly_tick_error_not_silent(tmp_path, monkeypatch, caplog):
+    """Б5: ошибка опроса юзера логируется, а не глотается молча."""
     tracked = tmp_path / "tracked_ips.json"
     tracked.write_text(json.dumps({"7": ["8.8.8.8"]}))
-    monkeypatch.setattr(m, "USERS_FILE", str(users))
-    monkeypatch.setattr(m, "TRACKED_IPS_FILE", str(tracked))
+    monkeypatch.setattr(cc, "TRACKED_IPS_FILE", str(tracked))
 
-    async def broken_pinger(ip, timeout=1.0):
+    async def broken_pinger(targets, timeout=1.0, throttle_obj=None):
         raise RuntimeError("network down")
 
-    monkeypatch.setattr(m, "async_ping_ip", broken_pinger)
+    # _check_user_ips использует ping_many, импортированный в модуль monitor.
+    monkeypatch.setattr(m, "ping_many", broken_pinger)
 
     sent = []
 
@@ -40,9 +43,61 @@ async def test_hourly_package_error_not_silent(tmp_path, monkeypatch):
             sent.append(a)
 
     monkeypatch.setattr(m, "bot", FakeBot())
-    await m.hourly_ping_package([7], 0.05, FakeBot(), results=([], [], [7]))
-    # ошибки собраны, отправка «нет данных» не произошла для error-юзера
-    assert sent == []
+    monkeypatch.setattr(m, "ALERT_CHAT_ID", None)
+    # Фоновый тик: pacing-паузы в тесте не нужны.
+    monkeypatch.setattr(m, "pace", lambda *a, **k: asyncio.sleep(0))
+
+    delivered = []
+
+    def fake_safe_send(method, *a, **k):
+        async def _inner():
+            delivered.append(a)          # попытка доставки была (ошибку видно в логе)
+            return None                  # имитация провала доставки
+        return _inner()
+
+    monkeypatch.setattr(m, "safe_send", fake_safe_send)
+
+    await m.hourly_monitor_tick()
+
+    # Ошибка пинга изолирована и залогирована (_check_user_ips),
+    # но отчёт с заведомо ложными 🔴 пользователю НЕ доставляется.
+    assert delivered and sent == []
+
+
+async def test_hourly_tick_delivers_report_with_cleanup_kb(tmp_path, monkeypatch):
+    """Автоотчёт доставляется и содержит кнопку «🧹» при наличии dead-IP."""
+    tracked = tmp_path / "tracked_ips.json"
+    tracked.write_text(json.dumps({"7": ["8.8.8.8", "1.1.1.1"]}))
+    monkeypatch.setattr(cc, "TRACKED_IPS_FILE", str(tracked))
+
+    async def fake_pinger(targets, timeout=1.0, throttle_obj=None):
+        return {ip: (ip == "8.8.8.8") for ip in targets}
+
+    monkeypatch.setattr(m, "ping_many", fake_pinger)
+    monkeypatch.setattr(m, "ALERT_CHAT_ID", None)
+    monkeypatch.setattr(m, "pace", lambda *a, **k: asyncio.sleep(0))
+
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
+            return object()
+
+    monkeypatch.setattr(m, "bot", FakeBot())
+
+    await m.hourly_monitor_tick()
+
+    assert len(sent) == 1
+    chat_id, text, kwargs = sent[0]
+    assert chat_id == 7
+    assert "🟢" in text and "🔴" in text
+    kb = kwargs.get("reply_markup")
+    assert kb is not None
+    btn = kb.inline_keyboard[0][0]
+    assert "Убрать неактивные ip" in btn.text
+    assert btn.callback_data.startswith(m.CLEANUP_CB_PREFIX)
+    assert len(btn.callback_data.encode()) < 64
 
 
 async def test_hourly_loop_survives_iteration_errors(tmp_path, monkeypatch):
@@ -55,11 +110,10 @@ async def test_hourly_loop_survives_iteration_errors(tmp_path, monkeypatch):
             raise asyncio.CancelledError   # остановить цикл после 2 циклов
 
     monkeypatch.setattr(m.asyncio, "sleep", fake_sleep)
-    # load_tracked_networks вернёт {} (файлов нет в tmp cwd?) — используем боевые пути,
-    # но пробросим ошибку на gather, эмулируя падение прохода:
-    async def boom(targets, timeout, bot_, results=None):
+
+    async def boom():
         raise RuntimeError("iteration failure")
-    monkeypatch.setattr(m, "hourly_ping_package", boom)
+    monkeypatch.setattr(m, "hourly_monitor_tick", boom)
 
     with pytest.raises(asyncio.CancelledError):
         await m.hourly_monitor_loop()

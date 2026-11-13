@@ -20,6 +20,7 @@ async def test_resize_increase_frees_slots():
 async def test_resize_decrease_takes_free_slots():
     t = cc.PingThrottle(5)
     t.resize(3)
+    await asyncio.sleep(0.02)            # фоновая задача _shrink отрабатывает на тиках цикла
     assert t.free == 3
     async with t():
         assert t.busy == 1
@@ -29,9 +30,21 @@ async def test_busy_never_negative_when_shrunk_below_active():
     t = cc.PingThrottle(4)
     async with t():
         t.resize(1)                      # уменьшение ниже числа активных
+        await asyncio.sleep(0.02)        # даём _shrink попытаться забрать свободные слоты
         assert t.busy >= 1               # busy не уходит в минус (Б13)
-        async with t():                  # новый слот всё равно доступен
-            pass
+        done = set()
+
+        async def second_slot():
+            async with t():              # новый слот доступен после освобождения holder'ом
+                done.add(True)
+
+        task = asyncio.create_task(second_slot())
+        await asyncio.sleep(0.01)         # заявка встаёт в очередь (слот занят)
+        assert not done                   # ждёт, пока активный holder не отпустит
+        # deadlock-регрессия: после выхода из `async with t()` ожидающая
+        # задача ОБЯЗАНА проснуться (раньше слот «украдался» резервом).
+    await asyncio.wait_for(task, timeout=1.0)
+    assert done == {True}
 
 
 async def test_concurrency_capped_by_limit():

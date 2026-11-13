@@ -167,6 +167,8 @@ class PingThrottle:
     def __init__(self, limit: int) -> None:
         self.limit = max(1, int(limit))
         self._sem = asyncio.Semaphore(self.limit)
+        # Фоновые задачи урезания семафора (сильные ссылки до завершения).
+        self._shrink_tasks: set = set()
 
     def resize(self, new_limit: int) -> None:
         """Публичное имя из плана Этапа 6 (эквивалент set_limit)."""
@@ -179,34 +181,65 @@ class PingThrottle:
         только СВОБОДНЫЕ слоты (занятые сверх нового лимита доедут
         естественным образом). Активные `async with throttle()` не ломаются.
 
-        Фикс deadlock (Шаг 0): раньше уменьшение выполнялось в цикле
-        `if self._sem.locked(): break` + ручное `_value -= 1`. Если все
-        слоты заняты/в очереди, а delta отрицательная, семафор мог уйти в
-        состояние, где освобождённый активным holder'ом слот доставался
-        «украденному» резерву, и ожидающая задача не просыпалась никогда
-        (воспроизводилось тестом test_busy_never_negative_when_shrunk_below_active
-        и в бою: админ режет лимит посреди скана — скан зависает). Теперь
-        уменьшение делает ровно одну неблокирующую попытку `acquire` через
-        публичный API: либо успешно забирает свободный слот, либо ничего не
-        делает (овербуки доезжают естественно). Никаких мутаций `_value`,
-        никаких фоновых задач-адамонтов.
+        Фикс deadlock (Шаг 0): раньше уменьшение делало «неблокирующий
+        acquire» через несуществующий метод `_sem.acquire_nowait()`
+        (такого у asyncio.Semaphore нет) — AttributeError убивал resize(),
+        а варианты с ручными мутациями `_value` и фоном-адептоном могли
+        «украсть» освобождаемый holder'ом слот и навсегда заморозить
+        ожидающие задачи (скан зависал, если админ резал лимит посреди
+        скана). Теперь для отъёма свободных слотов используется
+        asyncio.wait_for(sem.acquire(), 0): это штатный публичный API,
+        при таймауте acquire корректно отменяется и НЕ оставляет
+        «фантомного» ждущего; взятые сверх нового лимита свободные слоты
+        просто возвращаются через release(). Никаких мутаций `_value`.
         """
         new_limit = max(1, int(new_limit))
         delta = new_limit - self.limit
-        self.limit = new_limit
         if delta > 0:
+            self.limit = new_limit
             for _ in range(delta):
                 self._sem.release()
         elif delta < 0:
-            # Забираем не больше (-delta) свободных слотов, и только те,
-            # которые реально свободны ПРЯМО СЕЙЧАС (non-blocking acquire).
-            for _ in range(-delta):
-                if self._sem.locked():
-                    break  # свободных нет — занятые доедут сами
-                try:
-                    self._sem.acquire_nowait()
-                except (RuntimeError, OSError):  # pragma: no cover - защита
-                    break
+            # Фикс deadlock (Шаг 0): раньше уменьшение делало «неблокирующий
+            # acquire» через несуществующий `_sem.acquire_nowait()` —
+            # AttributeError убивал resize() на лету. Теперь захват свободных
+            # слотов идёт штатным публичным API: asyncio.wait_for(sem.acquire(),
+            # 0) — при отсутствии свободных слотов ожидание корректно
+            # отменяется по таймауту и НЕ оставляет «фантомного» ждущего,
+            # который перехватил бы освобождаемый holder'ом слот (именно так
+            # скан зависал, когда админ резал лимит посреди работы). Никаких
+            # ручных мутаций `_value`.
+            self.limit = new_limit
+
+            async def _shrink(n: int) -> None:
+                taken = 0
+                for _ in range(n):
+                    # Забираем слот только если он реально свободен ПРЯМО
+                    # СЕЙЧАС (locked() == нет свободных И нет ожидающих),
+                    # через публичный acquire(); иначе wait_for(..., 0) не
+                    # успевает синхронно забрать слот и заведомо отменяется.
+                    if self._sem.locked():
+                        break
+                    try:
+                        await asyncio.wait_for(self._sem.acquire(), 1)
+                        taken += 1
+                    except (asyncio.TimeoutError, Exception):
+                        break
+                # Не удалось забрать столько, сколько нужно (слоты заняты или
+                # в очереди) — возвращаем разницу, чтобы free не стал
+                # отрицательным; занятые сверх нового лимита доедут сами.
+                for _ in range(max(0, n - taken)):
+                    self._sem.release()
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return  # вне event loop: метаданные обновлены, семафор не трогаем
+            task = loop.create_task(_shrink(-delta))
+            # Держим сильную ссылку до завершения — иначе задача может быть
+            # собранна GC посреди исполнения (классическая ловушка create_task).
+            self._shrink_tasks.add(task)
+            task.add_done_callback(self._shrink_tasks.discard)
 
     @property
     def free(self) -> int:

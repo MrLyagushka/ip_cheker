@@ -36,6 +36,36 @@ def isolated_env(tmp_path_factory):
     for var in ("TOKEN", "PROXY_URL", "MAX_CONCURRENT_PINGS", "ADMIN_ID",
                 "ALERT_CHAT_ID", "ALERT_THREAD_ID"):
         os.environ.pop(var, None)
+    # Боевой .env из каталога проекта не должен попадать в окружение тестов:
+    # aiogram-зависимые модули (config, handlers.*) могут быть импортированы
+    # раньше этой фикстуры (например, плагинами pytest) и вызвать load_env().
+    for var in ("TOKEN", "PROXY_URL", "MAX_CONCURRENT_PINGS", "ADMIN_ID",
+                "ALERT_CHAT_ID", "ALERT_THREAD_ID"):
+        os.environ.pop(var, None)
+    # config.py при импорте вызывает load_env(); если в рабочем каталоге
+    # лежит настоящий .env (с боевым TOKEN/ALERT_CHAT_ID), он перетирает
+    # тестовые переменные окружения и ломает изоляцию (Б20-тест видел
+    # реальный ALERT_CHAT_ID). Временная заглушка ENV_FILE на время импорта
+    # гарантирует, что читаётся только тестовый .env из tmp_path.
+    real_env = os.environ.get("ENV_FILE")
+    # ВАЖНО: config_core читает ENV_FILE один раз при импорте в модульную
+    # константу, поэтому патчим её тоже — иначе load_env() внутри config.py
+    # прочитает настоящий боевой .env из каталога проекта (реальный
+    # ALERT_CHAT_ID/TOKEN) и изоляция тестов сломается.
+    import config_core as _cc
+    _cc.ENV_FILE = str(env)
+    os.environ["ENV_FILE"] = str(env)
+    try:
+        import config  # noqa: F401 — прогрев с тестовым .env
+    finally:
+        if real_env is not None:
+            os.environ["ENV_FILE"] = real_env
+    # load_env() внутри config.py перечитал тестовый .env в os.environ —
+    # убираем его обратно, чтобы боевые/тестовые значения не смешивались
+    # при повторных импортах в других сессиях.
+    for var in ("TOKEN", "PROXY_URL", "MAX_CONCURRENT_PINGS", "ADMIN_ID",
+                "ALERT_CHAT_ID", "ALERT_THREAD_ID"):
+        os.environ.pop(var, None)
     yield {"data": data, "env": env}
 
 
