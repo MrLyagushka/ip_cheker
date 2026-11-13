@@ -9,7 +9,10 @@
 - Б9/Б3 — история с типами записей subnet/host вместо псевдо-подсетей из
   одиночных IP; запрещённые x.x.0.0 не попадают в историю ни одним путём;
   добавлены scanned_by и ограничение размера истории;
-- Б6 — флаг активности через ActiveUserRegistry (stale-очистка зависших записей).
+- Б6 — флаг активности через ActiveUserRegistry (stale-очистка зависших записей);
+- Б25 — доставка финального отчёта через safe_send/safe_edit (ретрай по
+  TelegramRetryAfter): раньше необработанный flood-wait «останавливал»
+  сканирование и глотался внешним except Exception.
 """
 import asyncio
 import json
@@ -19,9 +22,11 @@ from datetime import datetime
 from html import escape
 
 from aiogram import Router
-from aiogram.types import Message, FSInputFile
+from aiogram.types import (
+    Message, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+)
 from aiogram.filters import Command, CommandObject
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 
 # Этап 1: единый пинг/валидация из config (Б19, Б4); throttle — мутируемый
 # семафор, админский лимит действует на этот модуль мгновенно (Б11).
@@ -29,6 +34,14 @@ import config
 from config import (
     active_users, init_files, HISTORY_FILE,
     async_ping_ip, classify_targets, result_path_for,
+)
+# Б25: flood-safe доставка (retry по e.retry_after + pacing массовых отправок).
+from delivery import safe_send, pace
+# Фича 2: компактное кодирование dead-IP в callback_data (<64 байт),
+# идемпотентное удаление из tracked_ips.json, сборка клавиатуры «🧹».
+from config_core import (
+    encode_dead_payload, decode_dead_payload, remove_dead_ips,
+    CLEANUP_CB_PREFIX, build_cleanup_kb as _build_cleanup_kb_core,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,7 +82,13 @@ def save_to_history(entries: list[dict]):
 
 
 async def _safe_edit(message: Message, text: str) -> bool:
-    """edit_text с защитой от flood-control/прочих ошибок Telegram (Б17)."""
+    """edit_text с защитой от flood-control/прочих ошибок Telegram (Б17, Б25).
+
+    Б25: при TelegramRetryAfter делаем ровно одну паузу по e.retry_after и
+    повторяем — прогресс-тик не должен «съедаться» флуд-контролем. Пауза
+    каппится 5 секундами: это интерактивный троттлируемый прогресс (~1 Гц),
+    долго ждать в нём бессмысленно — следующий тик всё равно через секунду.
+    """
     try:
         await message.edit_text(text, parse_mode="HTML")
         return True
@@ -77,6 +96,72 @@ async def _safe_edit(message: Message, text: str) -> bool:
         return False
     except Exception:
         return False
+
+
+# ─────────────────────── Статусы и кнопки (фичи 1–2, Б25) ────────────────────
+
+# Секция «Статусы» выводится только для одиночных целей: подсеть — это 256
+# строк, они гарантированно пробивают лимит 4096 символов и бесполезны в чате
+# (полный список есть в result.txt).
+STATUS_SECTION_MAX_HOSTS = 30
+TELEGRAM_MESSAGE_LIMIT = 4096
+TRUNCATION_HINT = "📎 Полный список статусов — в файле result.txt"
+
+
+def build_status_section(results_list: list[tuple[str, bool]],
+                         header: str = "Статусы") -> str:
+    """Секция «🟢/🔴 напротив каждого хоста» (фича 1). Пустая строка для подсетей."""
+    if len(results_list) > STATUS_SECTION_MAX_HOSTS:
+        return ""
+    if not results_list:
+        return ""
+    lines = [f"📋 <b>{header}:</b>", ""]
+    for ip, alive in results_list:
+        icon = "🟢" if alive else "🔴"
+        lines.append(f"{icon} <code>{escape(ip)}</code>")
+    return "\n".join(lines)
+
+
+def fit_with_status(final_message: str, status_section: str) -> tuple[str, str]:
+    """Упаковка финального текста + секции статусов в лимит 4096 символов.
+
+    Возвращает (текст_сообщения, примечание_об_урезке): если секция не влезает,
+    она усекается по целым строкам и добавляется отсылка к result.txt.
+    """
+    if not status_section:
+        return final_message, ""
+    candidate = final_message + "\n\n" + status_section
+    if len(candidate) <= TELEGRAM_MESSAGE_LIMIT:
+        return candidate, ""
+    budget = TELEGRAM_MESSAGE_LIMIT - len(final_message) - 2 - len(TRUNCATION_HINT) - 1
+    kept: list[str] = []
+    size = 0
+    for line in status_section.split("\n"):
+        add = len(line) + (1 if kept else 0)
+        if size + add > max(budget, 0):
+            break
+        kept.append(line)
+        size += add
+    note = "⚠️ Список статусов усечён из-за лимита Telegram (4096 символов)."
+    text = final_message + "\n\n" + "\n".join(kept) + "\n…" if kept else final_message
+    return text, note + " " + TRUNCATION_HINT
+
+
+def build_cleanup_kb(dead_ips: list[str]) -> InlineKeyboardMarkup | None:
+    """Inline-клавиатура «🧹 Убрать неактивные ip» (фича 2).
+
+    None — если мёртвых адресов нет (кнопка не нужна). Компактное кодирование
+    dead-IP в callback_data (<64 байт) и идемпотентное удаление — в config_core.
+    """
+    payload = encode_dead_payload(dead_ips)
+    if not payload:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"🧹 Убрать неактивные ip ({len(dead_ips)})",
+            callback_data=CLEANUP_CB_PREFIX + payload,
+        )
+    ]])
 
 
 @router.message(Command("scan"))
