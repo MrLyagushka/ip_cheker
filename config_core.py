@@ -339,6 +339,14 @@ def init_files():
             with open(f, "w", encoding="utf-8") as fh:
                 fh.write(empty)
 
+    # Прокси хранятся в SQLite (data/proxies.db), а не в .env: переносим
+    # legacy-значения (PROXY_URL из .env, proxies.json) при первом старте.
+    try:
+        import proxy_db
+        proxy_db.migrate_legacy(env_file=ENV_FILE)
+    except Exception as e:  # pragma: no cover - миграция не валит старт бота
+        logger.warning("Миграция прокси в БД не выполнена: %r", e)
+
 
 # ─────────────────────────── Единый пинг (Б19) ──────────────────────────────
 

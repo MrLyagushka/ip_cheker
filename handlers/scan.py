@@ -159,15 +159,16 @@ def fit_with_status(final_message: str, status_section: str) -> tuple[str, str]:
     return final_message, note
 
 
-def build_cleanup_kb(dead_ips: list[str]) -> InlineKeyboardMarkup | None:
+def build_cleanup_kb(dead_ips: list[str], single: bool = False) -> InlineKeyboardMarkup | None:
     """Inline-клавиатура «🧹 Убрать неактивные ip» (фича 2).
 
     None — если мёртвых адресов нет или ни один не кодируется в payload.
     Компактное кодирование dead-IP в callback_data (<64 байт) и идемпотентное
     удаление — в config_core; хендлер колбэка — в handlers/monitor.py.
+    single=True — кнопка ставится даже без кодируемых IPv4 (см. monitor).
     """
     from handlers.monitor import build_cleanup_kb as _shared_build_kb
-    return _shared_build_kb(dead_ips)
+    return _shared_build_kb(dead_ips, single=single)
 
 
 @router.message(Command("scan"))
@@ -380,7 +381,7 @@ async def cmd_scan(message: Message, command: CommandObject):
         # кнопка «🧹 Убрать неактивные ip» под финальным сообщением.
         status_section = build_status_section(results_list)
         final_text, trunc_note = fit_with_status(final_message, status_section)
-        cleanup_kb = build_cleanup_kb(dead_ips)
+        cleanup_kb = build_cleanup_kb(dead_ips, single=len(raw_args) == 1)
 
         delivered = await _safe_edit(status_msg, final_text, reply_markup=cleanup_kb)
         if not delivered:
