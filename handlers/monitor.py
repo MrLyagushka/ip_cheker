@@ -21,6 +21,7 @@ from config import (
     ALERT_CHAT_ID, ALERT_THREAD_ID, is_valid_ipv4, ping_many,
     load_tracked_ips, save_tracked_ips,
     encode_dead_payload, decode_dead_payload, remove_dead_ips,
+    format_monitor_report,
     CLEANUP_CB_PREFIX,
 )
 # Б25: flood-safe доставка для фоновых тиков и массовых рассылок.
@@ -33,7 +34,7 @@ router = Router()
 
 # ───────────── Кнопка «🧹 Убрать неактивные ip» + callback-хендлер ───────────
 
-def build_cleanup_kb(dead_ips: list[str]) -> InlineKeyboardMarkup | None:
+def build_cleanup_kb(dead_ips: list[str], single: bool = False) -> InlineKeyboardMarkup | None:
     """Inline-клавиатура «🧹 Убрать неактивные ip» (фича 2).
 
     None — если мёртвых адресов нет или ни один не кодируется в payload.
@@ -42,16 +43,24 @@ def build_cleanup_kb(dead_ips: list[str]) -> InlineKeyboardMarkup | None:
     Ставится под финальные сообщения /scan, /check_ip и ежечасного автоотчёта;
     под групповые алерты НЕ ставится (алерт видит вся группа, а удалять список
     будет тот, кто нажал).
+
+    Исправление бага «под сообщением об автопроверке нет кнопки»: Telegram
+    отбрасывает весь reply_markup целиком, если хотя бы одна callback_data
+    длиннее 64 байт (например, в списке мониторинга есть внешний IPv6-хост,
+    который не проходит is_valid_ipv4). Поэтому при `single=True` (сообщение
+    содержит статусы ровно одного адреса) кнопка ставится всегда — с пустым
+    payload, чтобы очистка работала даже когда все цели — не-IPv4.
     """
     payload = encode_dead_payload(dead_ips)
-    if not payload:
+    if not payload and not single:
         return None
     # Счётчик в тексте — по реально кодируемым адресам (payload обрезается до
     # DEAD_IPS_MAX, кнопка не должна обещать больше, чем удалит).
     encoded = decode_dead_payload(payload)
+    label = f"🧹 Убрать неактивные ip ({len(encoded)})" if encoded else "🧹 Очистить IP"
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
-            text=f"🧹 Убрать неактивные ip ({len(encoded)})",
+            text=label,
             callback_data=CLEANUP_CB_PREFIX + payload,
         )
     ]])
@@ -66,15 +75,28 @@ async def cb_cleanup_dead_ips(callback: CallbackQuery):
     * удаление идемпотентно и только по адресам нажимающего пользователя
       (config_core.remove_dead_ips): повторный тап ничего не ломает, чужие
       списки не затрагиваются;
+    * пустой payload («🧹 Очистить IP», single-режим build_cleanup_kb) —
+      удаляет ВСЕ адреса из списка нажавшего, включая не-IPv4 (например,
+      IPv6-хосты), которые нельзя закодировать в callback_data;
     * после обработки клавиатура снимается (edit_reply_markup); если текст
       итогового сообщения недоступен правке (старое/служебное) — это не беда.
     """
     try:
         dead = decode_dead_payload(callback.data[len(CLEANUP_CB_PREFIX):])
-        if not dead:
+        if not dead and callback.data.strip() != CLEANUP_CB_PREFIX:
             await callback.answer("⚠️ Список не распознан — обновите данные командой /get_ip",
                                   show_alert=True)
             return
+        if not dead:
+            # Кнопка «Очистить IP» без счётчика: чистим весь список юзера.
+            dead = list(load_tracked_ips().get(str(callback.from_user.id), []))
+            if not dead:
+                await callback.answer("ℹ️ Ваш список мониторинга уже пуст.")
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
         removed, skipped = remove_dead_ips(callback.from_user.id, dead)
         if removed:
             note = f"🧹 Убрано из мониторинга: {len(removed)} шт."
@@ -273,7 +295,11 @@ async def cmd_check_ip(message: Message):
         report_lines.append(f"\n🟢 Доступно: <b>{alive_count}</b> | 🔴 Недоступно: <b>{dead_count}</b>")
 
         # Фича 2: кнопка «🧹 Убрать неактивные ip» под финальным отчётом.
-        kb = build_cleanup_kb([ip for ip, alive in results if not alive])
+        # single=True: при одной цели кнопка («Очистить IP») ставится всегда —
+        # иначе для не-IPv4-хоста (например, IPv6) payload пуст и Telegram-
+        # сообщение уходит без кнопки очистки.
+        kb = build_cleanup_kb([ip for ip, alive in results if not alive],
+                              single=len(results) == 1)
         # Б25: edit с ретраем по RetryAfter; fallback — новое сообщение.
         if not await safe_edit(status_msg, "\n".join(report_lines), reply_markup=kb):
             await safe_send(message.answer, "\n".join(report_lines),
@@ -303,15 +329,10 @@ async def _check_user_ips(user_id_str: str, ips: list[str]) -> dict:
 
 
 def _format_report(results: list[tuple[str, bool]]) -> str:
-    lines = ["⏰ <b>Ежечасный автоотчет мониторинга:</b>", "━" * 22]
-    alive_count = 0
-    for ip, alive in results:
-        alive_count += 1 if alive else 0
-        lines.append(f"{'🟢' if alive else '🔴'} <code>{escape(str(ip))}</code>")
-    dead_count = len(results) - alive_count
-    lines.append("")
-    lines.append(f"🟢 Доступно: <b>{alive_count}</b> | 🔴 Недоступно: <b>{dead_count}</b>")
-    return "\n".join(lines)
+    """Делегат в config_core.format_monitor_report (импортирован как
+    _format_report) — убран дубль текста отчёта (принцип из PROJECT_CONTEXT:
+    перед правкой определить реально используемый путь)."""
+    return format_monitor_report(results)
 
 
 def _format_alert(user_id: int, dead_ips: list[str]) -> str:
@@ -356,7 +377,7 @@ async def hourly_monitor_tick():
         # Б25: safe_send c ретраем по RetryAfter; cap=300 — фоновый тик не
         # должен блокироваться длинными паузами (лимит Telegram ~1 msg/sec на
         # чат здесь не актуален: лички разные, но общий лимит 30 msg/sec есть).
-        kb = build_cleanup_kb(dead_ips)
+        kb = build_cleanup_kb(dead_ips, single=len(results) == 1)
         try:
             # safe_send сам перехватывает TelegramRetryAfter/прочие
             # TelegramAPIError и возвращает None; TelegramForbiddenError

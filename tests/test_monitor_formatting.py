@@ -118,3 +118,50 @@ async def test_hourly_loop_survives_iteration_errors(tmp_path, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await m.hourly_monitor_loop()
     assert calls["n"] >= 2               # цикл дожил после ошибки прохода (Б10)
+
+
+async def test_hourly_tick_single_dead_ipv6_still_shows_cleanup_button(tmp_path, monkeypatch):
+    """Регрессия бага «под сообщением об автопроверке нет кнопки «Очистить IP»».
+
+    Одиночный не-IPv4 хост (например, IPv6) не кодируется в callback_data —
+    раньше build_cleanup_kb возвращал None и автоотчёт уходил без кнопки.
+    Теперь для сообщения с одной целью кнопка ставится всегда («🧹 Очистить IP»,
+    пустой payload = очистка всего списка нажавшего)."""
+    tracked = tmp_path / "tracked_ips.json"
+    tracked.write_text(json.dumps({"7": ["2001:db8::1"]}))
+    monkeypatch.setattr(cc, "TRACKED_IPS_FILE", str(tracked))
+
+    async def fake_pinger(targets, timeout=1.0, throttle_obj=None):
+        return {ip: False for ip in targets}
+
+    monkeypatch.setattr(m, "ping_many", fake_pinger)
+    monkeypatch.setattr(m, "ALERT_CHAT_ID", None)
+    monkeypatch.setattr(m, "pace", lambda *a, **k: asyncio.sleep(0))
+
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text, kwargs))
+            return object()
+
+    monkeypatch.setattr(m, "bot", FakeBot())
+
+    await m.hourly_monitor_tick()
+
+    assert len(sent) == 1
+    kb = sent[0][2].get("reply_markup")
+    assert kb is not None, "кнопка очистки обязательна под одиночным автоотчётом"
+    btn = kb.inline_keyboard[0][0]
+    assert "Очистить IP" in btn.text
+    assert btn.callback_data == m.CLEANUP_CB_PREFIX  # пустой payload
+
+
+def test_build_cleanup_kb_payload_always_within_callback_limit():
+    """Кнопка есть всегда, даже когда ни один адрес не кодируется в payload."""
+    assert m.build_cleanup_kb([]) is None                       # мёртвых нет
+    assert m.build_cleanup_kb(["не-ip"]) is None                # список целей >1
+    kb = m.build_cleanup_kb(["не-ip"], single=True)             # одна цель
+    assert kb is not None and len(kb.inline_keyboard[0][0].callback_data.encode()) < 64
+    kb2 = m.build_cleanup_kb(["8.8.8.8"])
+    assert "Убрать неактивные ip (1)" in kb2.inline_keyboard[0][0].text
