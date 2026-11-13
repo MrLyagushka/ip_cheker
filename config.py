@@ -25,6 +25,11 @@ import os
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+# Пул прокси: список в data/proxies.json, рандомный прокси на каждый запрос к
+# Telegram API и ротация на другой прокси при ошибке соединения (см. proxy_pool).
+import proxy_pool
+from proxy_pool import ProxyPool, pool as proxy_pool_instance
+
 # Реэкспорт всего чистого ядра: ранние версии кода и handlers импортируют
 # эти имена из config — API сохраняется без дублирования логики.
 from config_core import (  # noqa: F401
@@ -81,21 +86,53 @@ bot = Bot(token=TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
 
+def _initial_proxy_urls() -> list[str]:
+    """Список прокси на старте: data/proxies.json; если пусто — PROXY_URL из .env."""
+    urls = proxy_pool.load_proxies()
+    if not urls and PROXY_URL:
+        urls = [PROXY_URL]
+        proxy_pool.save_proxies(urls)
+    return urls
+
+
+# Ротация прокси: bot.session заменяется обёрткой, выбирающей случайный прокси
+# из пула на каждый запрос и переключающейся на другой при ошибке соединения.
+proxy_pool.setup_rotation(bot, build_session, _initial_proxy_urls())
+
+
 def set_proxy(new_url):
-    """Атомарная смена прокси/сессии бота (используется админ-панелью).
+    """Атомарная смена ЕДИНСТВЕННОГО прокси бота (используется админ-панелью).
 
     Обновляет config.PROXY_URL, пересоздаёт сессию через build_session()
-    (валидный AiohttpSession даже при отключённом прокси — Б12) и подменяет
-    bot.session живого Bot без перезапуска процесса. Возвращает СТАРУЮ сессию
-    (или None) — вызывающая сторона ОБЯЗАНА закрыть её асинхронно через
-    `await old.close()` (Этап 6), чтобы не оставлять висящих соединений.
+    (валидный AiohttpSession даже при отключённом прокси — Б12), подменяет
+    базовую сессию живого Bot без перезапуска процесса и синхронизирует пул
+    ротации (список прокси = [new_url], либо пуст при отключении). Возвращает
+    СТАРУЮ сессию (или None) — вызывающая сторона ОБЯЗАНА закрыть её
+    асинхронно через `await old.close()` (Этап 6).
+
+    Для накопительного списка прокси (рандомный выбор + ротация при ошибках)
+    служит pool.add()/pool.replace_all() — см. handlers/admin.py «🌐 Пул прокси».
     """
     global PROXY_URL, session
     new_url = (new_url or "").strip() or None
-    old_session = session
+    base = getattr(bot.session, "_base", bot.session)
+    old_session = base
     new_session = build_session(new_url)
-    bot.session = new_session
+    if isinstance(bot.session, proxy_pool.RotatingSessionProxy):
+        bot.session._base = new_session
+    else:  # ротация не установлена — меняем сессию напрямую (старое поведение)
+        bot.session = new_session
     session = new_session
     PROXY_URL = new_url
     save_env_value("PROXY_URL", new_url or "")
+    # Пул должен пережить смену: иначе запросы пойдут через старый (закрываемый) прокси.
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        loop.create_task(proxy_pool.pool.replace_all([new_url] if new_url else []))
+    else:  # pragma: no cover - только вне event loop (тесты/CLI)
+        proxy_pool.pool.configure([new_url] if new_url else [])
     return old_session

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from aiogram import Bot, Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
@@ -17,6 +17,8 @@ from config import (
     ADMIN_ID, HISTORY_FILE, TRACKED_IPS_FILE,
     USERS_FILE, save_env_value, bot, throttle,
 )
+# Пул прокси: рандомный выбор на каждый запрос + ротация при ошибке соединения.
+import proxy_pool
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,17 @@ def _threads_line() -> str:
         f"🟢 Свободных потоков: <code>{throttle.free}/{throttle.limit}</code>"
     )
 
+
+def _proxy_line() -> str:
+    """Строка о прокси в панели: активный + размер пула ротации."""
+    active = proxy_pool.mask_url(config.PROXY_URL) if config.PROXY_URL \
+        else "Отключен (прямое соединение)"
+    n = len(proxy_pool.pool.urls)
+    return (f"🌐 Текущий прокси: <code>{active}</code>\n"
+            f"🔄 Прокси в пуле: <code>{n}</code> "
+            f"(выбор случайного на каждый запрос, ротация при ошибке)")
+
+
 class AdminStates(StatesGroup):
     waiting_for_concurrency = State()
     waiting_for_proxy = State()
@@ -71,6 +84,7 @@ def get_admin_keyboard():
         [InlineKeyboardButton(text="📊 Статистика бота", callback_data="admin_stats")],
         [InlineKeyboardButton(text="⚙️ Макс. потоки", callback_data="set_concurrency"),
          InlineKeyboardButton(text="🌐 Прокси", callback_data="set_proxy")],
+        [InlineKeyboardButton(text="🧾 Пул прокси", callback_data="proxy_list")],
         [InlineKeyboardButton(text="📢 Сделать рассылку", callback_data="start_broadcast")],
         [InlineKeyboardButton(text="🧹 Очистить историю сетей", callback_data="clear_history")],
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_admin"),
@@ -83,11 +97,10 @@ async def cmd_admin(message: Message):
         await message.answer("❌ У вас нет доступа к этой команде.")
         return
 
-    proxy_status = config.PROXY_URL if config.PROXY_URL else "Отключен (прямое соединение)"
     text = (
         "🛠 <b>Расширенная панель администратора</b>\n\n"
         f"{_threads_line()}\n"
-        f"🌐 Текущий прокси: <code>{proxy_status}</code>\n\n"
+        f"{_proxy_line()}\n\n"
         "Выберите действие в меню ниже:"
     )
     await message.answer(text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
@@ -141,11 +154,11 @@ async def cb_refresh_admin(callback: CallbackQuery):
         await callback.answer("Нет доступа!", show_alert=True)
         return
     
-    proxy_status = config.PROXY_URL if config.PROXY_URL else "Отключен"
+    proxy_line = _proxy_line()
     text = (
         "🛠 <b>Расширенная панель администратора</b>\n\n"
         f"{_threads_line()}\n"
-        f"🌐 Текущий прокси: <code>{proxy_status}</code>\n\n"
+        f"{proxy_line}\n\n"
         "Выберите действие в меню ниже:"
     )
     await callback.message.edit_text(text, reply_markup=get_admin_keyboard(), parse_mode="HTML")
@@ -220,13 +233,86 @@ async def cb_set_proxy(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа!", show_alert=True)
         return
+    pool_n = len(proxy_pool.pool.urls)
+    pool_line = (f"\nВ пуле сейчас <b>{pool_n}</b> прокси — отправленный URL будет\n"
+                 "<b>добавлен</b> к ним (не заменит их).\n" if pool_n else "")
     await callback.message.answer(
         "Введите новый URL прокси (например: <code>socks5://user:pass@ip:port</code>)\n"
-        "Или отправьте слово <code>none</code>, чтобы полностью отключить прокси:",
+        "Или отправьте слово <code>none</code>, чтобы полностью отключить прокси.\n"
+        "Слово <code>list</code> — показать пул, <code>clear</code> — очистить его."
+        + pool_line,
         parse_mode="HTML"
     )
     await state.set_state(AdminStates.waiting_for_proxy)
     await callback.answer()
+
+
+def _proxy_list_kb() -> InlineKeyboardMarkup | None:
+    """Кнопки удаления прокси из пула (callback_data ≤64 байта)."""
+    rows = []
+    for url in proxy_pool.pool.urls:
+        data = f"px_del|{url}"
+        if len(data.encode("utf-8")) > 64:
+            continue  # Telegram не примет — молча пропускаем (малоявимо: URL короткий)
+        rows.append([InlineKeyboardButton(text=f"🗑 {proxy_pool.mask_url(url)}",
+                                          callback_data=data)])
+    rows.append([InlineKeyboardButton(text="⬅️ В админку", callback_data="refresh_admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _proxy_list_text() -> str:
+    urls = proxy_pool.pool.urls
+    lines = ["🧾 <b>Пул прокси</b> (бот выбирает случайный на каждый запрос,\n"
+             "при ошибке соединения Telegram — переключается на другой):\n"]
+    if not urls:
+        lines.append("Пусто. Добавьте прокси через «🌐 Прокси».")
+    for i, u in enumerate(urls, 1):
+        lines.append(f"{i}. <code>{proxy_pool.mask_url(u)}</code>")
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data == "proxy_list")
+async def cb_proxy_list(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    await callback.message.answer(await _proxy_list_text(),
+                                  reply_markup=_proxy_list_kb(), parse_mode="HTML")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("px_del|"))
+async def cb_proxy_delete(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа!", show_alert=True)
+        return
+    url = callback.data.split("|", 1)[1]
+    removed = await proxy_pool.pool.remove(url)
+    # Активный PROXY_URL убрали из пула — переключаемся на прямой режим,
+    # иначе config.PROXY_URL продолжит показывать несуществующий прокси.
+    if removed and config.PROXY_URL == url:
+        old = config.set_proxy(None)   # сам синхронизирует пул и чистит .env
+        if old is not None:
+            try:
+                await old.close()
+            except Exception as e:
+                logger.warning("Не удалось закрыть старую сессию: %r", e)
+        removed_note = "Это был активный прокси — переключено на прямое соединение."
+    else:
+        removed_note = ""
+    text = await _proxy_list_text()
+    if removed:
+        text = f"✅ Удалён: <code>{proxy_pool.mask_url(url)}</code>\n{removed_note}\n\n" + text
+        try:
+            await callback.message.edit_text(text, reply_markup=_proxy_list_kb(),
+                                             parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(text, reply_markup=_proxy_list_kb(),
+                                          parse_mode="HTML")
+        await callback.answer("Прокси удалён")
+    else:
+        await callback.answer("Такого прокси в пуле нет")
+
 
 @router.message(AdminStates.waiting_for_proxy)
 async def process_new_proxy(message: Message, state: FSMContext):
@@ -242,8 +328,25 @@ async def process_new_proxy(message: Message, state: FSMContext):
         return
 
     new_proxy = message.text.strip()
-    if new_proxy.lower() in ["none", "off", "откл", "нет"]:
+    low = new_proxy.lower()
+    if low in ["none", "off", "откл", "нет"]:
         new_proxy = None
+    elif low == "list":
+        await state.clear()
+        await message.answer(await _proxy_list_text(),
+                             reply_markup=_proxy_list_kb(), parse_mode="HTML")
+        return
+    elif low == "clear":
+        await state.clear()
+        await proxy_pool.pool.replace_all([])
+        old = config.set_proxy(None)
+        if old is not None:
+            try:
+                await old.close()
+            except Exception as e:
+                logger.warning("Не удалось закрыть старую сессию: %r", e)
+        await message.answer("🧹 Пул прокси очищен, прокси отключён (прямое соединение).")
+        return
     # Этап 1+6: вся атомарная логика смены прокси в config.set_proxy():
     # обновляет PROXY_URL, строит НОВУЮ валидную AiohttpSession (никогда не
     # None — Б12), подменяет bot.session и пишет чистое значение в .env.
@@ -256,10 +359,49 @@ async def process_new_proxy(message: Message, state: FSMContext):
             await old_session.close()
         except Exception as e:
             logger.warning("Не удалось закрыть старую сессию: %r", e)
+    added = False
+    if new_proxy:
+        # Новый прокси ВСЕГДА попадает в список пула: бот начнёт выбирать его
+        # случайно наряду с остальными (требование: «заносится в список прокси»).
+        added = await proxy_pool.pool.add(new_proxy)
     await state.clear()
 
-    status_text = f"<b>{config.PROXY_URL}</b>" if config.PROXY_URL else "отключен (прямое соединение)"
-    await message.answer(f"✅ Прокси успешно изменен на: {status_text} и сохранен в <code>.env</code>.", parse_mode="HTML")
+    status_text = f"<b>{proxy_pool.mask_url(config.PROXY_URL)}</b>" if config.PROXY_URL \
+        else "отключен (прямое соединение)"
+    n = len(proxy_pool.pool.urls)
+    note = " Добавлен в список прокси." if added else ""
+    await message.answer(
+        f"✅ Прокси успешно изменен на: {status_text} и сохранен в <code>.env</code>."
+        f"{note}\n🔄 В пуле: {n} шт.",
+        parse_mode="HTML")
+
+
+@router.message(Command("add_proxy"))
+async def cmd_add_proxy(message: Message, command: CommandObject):
+    """Админ: добавить прокси в пул, НЕ меняя активный. /add_proxy socks5://user:pass@ip:1080"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    url = (command.args or "").strip().split()[0] if command.args else ""
+    if not url:
+        await message.answer(
+            "❌ Укажите URL прокси!\nПример:\n"
+            "<code>/add_proxy socks5://user:pass@1.2.3.4:1080</code>",
+            parse_mode="HTML")
+        return
+    if "://" not in url:
+        await message.answer(
+            "❌ Неверный формат. Ожидается <code>socks5://user:pass@host:port</code> "
+            "(или http/socks4).", parse_mode="HTML")
+        return
+    added = await proxy_pool.pool.add(url)
+    if not added:
+        await message.answer("⚠️ Такой прокси уже есть в списке.")
+        return
+    await message.answer(
+        f"✅ Прокси <code>{proxy_pool.mask_url(url)}</code> добавлен в список.\n"
+        f"🔄 В пуле: {len(proxy_pool.pool.urls)} шт. — бот выбирает случайный "
+        "на каждый запрос, при ошибке Telegram переключается на другой.")
 
 @router.callback_query(F.data == "start_broadcast")
 async def cb_start_broadcast(callback: CallbackQuery, state: FSMContext):

@@ -2,7 +2,8 @@ import asyncio
 import logging
 
 from config import dp, bot, init_files, setup_logging
-from handlers import start, scan, tree, admin, monitor
+import proxy_pool
+from handlers import start, scan, tree, admin, monitor, proxy_cmd
 from handlers.middlewares import UserRegistrationMiddleware
 from handlers.monitor import hourly_monitor_loop
 
