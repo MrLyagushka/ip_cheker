@@ -1,10 +1,12 @@
-"""Пул прокси бота: список в data/proxies.json + рандомный прокси на каждый запрос.
+"""Пул прокси бота: список в SQLite (data/proxies.db) + рандомный прокси на запрос.
 
 Как это работает (требование пользователя):
 * `/get_proxy` — генерирует логин/пароль и команду `docker run ... serjs/go-socks5-proxy`;
   пользователь запускает контейнер на своём хосте;
 * админ добавляет полученный `socks5://user:pass@host:1080` в список прокси
   (админ-панель → «🌐 Прокси»);
+* прокси хранятся В БД (sqlite3, proxy_db.py), а не в .env — ключ PROXY_URL из
+  .env мигрирует в таблицу при первом старте и больше там не используется;
 * дальше бот выбирает СЛУЧАЙНЫЙ прокси из пула для каждого запроса к Telegram API;
 * если Telegram ответил ошибкой соединения/таймаутом — берётся ДРУГОЙ прокси и
   запрос повторяется (не более MAX_SESSIONS_PER_REQUEST попыток за запрос).
@@ -26,14 +28,11 @@ aiohttp у AiohttpSession создаётся лениво, поэтому сме
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import random
 import secrets
 import string
 from html import escape as _html_escape
-from pathlib import Path
 from typing import Any
 
 import certifi
@@ -44,12 +43,13 @@ from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import TelegramMethod
 
+# Хранилище прокси — SQLite (proxy_db), НЕ .env и НЕ proxies.json.
+from proxy_db import (  # noqa: F401  (реэкспорт API для совместимости)
+    ProxyDB, db as proxy_db, normalize_url, mask_url,
+    load_proxies, save_proxies, migrate_legacy,
+)
+
 logger = logging.getLogger(__name__)
-
-# ─────────────────────────── Хранилище списка прокси ────────────────────────
-
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-PROXIES_FILE = str(DATA_DIR / "proxies.json")
 
 # Максимум разных прокси за один запрос (первый + ротации после сетевых ошибок).
 MAX_SESSIONS_PER_REQUEST = 3
@@ -82,54 +82,15 @@ def build_docker_run(user: str, password: str, port: int = 1080) -> str:
     )
 
 
-def load_proxies(path: str | None = None) -> list[str]:
-    """Читает список proxy-URL из JSON-файла (массив строк). Ошибки → []."""
-    try:
-        with open(path or PROXIES_FILE, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return []
-    if not isinstance(data, list):
-        return []
-    return [str(u).strip() for u in data if str(u).strip()]
-
-
-def save_proxies(urls: list[str], path: str | None = None) -> bool:
-    """Атомарная запись списка (temp + replace, как save_env_value)."""
-    try:
-        p = Path(path or PROXIES_FILE)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(list(urls), fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, p)
-        return True
-    except OSError as e:
-        logger.error("Не удалось сохранить %s: %r", path or PROXIES_FILE, e)
-        return False
-
-
-def mask_url(url: str) -> str:
-    """Proxy-URL без пароля — для логов и сообщений."""
-    try:
-        if "://" in url and "@" in url:
-            scheme, rest = url.split("://", 1)
-            creds, host = rest.rsplit("@", 1)
-            user = creds.split(":", 1)[0]
-            return f"{scheme}://{user}:***@{host}"
-    except Exception:
-        pass
-    return "***"
-
-
 # ───────────────────────────── Пул сессий ───────────────────────────────────
 
 
 class ProxyPool:
-    """Хранит список proxy-URL и выдаёт сессию aiogram с нужным прокси."""
+    """Кэш прокси-URL (источник истины — SQLite proxy_db) + выдача сессий."""
 
-    def __init__(self, factory):
+    def __init__(self, factory, storage: ProxyDB | None = None):
         self._factory = factory                      # callable(url|None) -> BaseSession
+        self._db = storage if storage is not None else proxy_db
         self._urls: list[str] = []
         self._sessions: dict[str, BaseSession] = {}  # url -> кэшированная сессия
         self._active: set[int] = set()               # id() сессий в запросе сейчас
@@ -148,38 +109,50 @@ class ProxyPool:
             self._schedule_close(sess)
 
     @property
+    def db(self) -> ProxyDB:
+        """БД прокси (для админ-хендлеров: get_active/set_active/count)."""
+        return self._db
+
+    @property
     def urls(self) -> list[str]:
         return list(self._urls)
 
     async def add(self, url: str) -> bool:
-        """Добавляет прокси в пул (с сохранением в proxies.json). False — дубликат/пусто."""
-        url = (url or "").strip()
-        if not url:
+        """Добавляет прокси в пул (с сохранением в БД). False — дубликат/пусто.
+
+        Первым добавленным прокси становится активным (если активного нет) —
+        решение принимает proxy_db.add().
+        """
+        normalized = normalize_url(url)
+        if not normalized:
             return False
         async with self._lock:
-            if url in self._urls:
+            if not self._db.add(normalized):
                 return False
-            self._urls.append(url)
-            save_proxies(self._urls)
+            if normalized not in self._urls:
+                self._urls.append(normalized)
         return True
 
     async def remove(self, url: str) -> bool:
         async with self._lock:
-            if url not in self._urls:
+            if not self._db.remove(url):
+                # строки в БД нет — возможно, рассинхрон кэша; чиним его
+                if url in self._urls:
+                    self._urls.remove(url)
                 return False
-            self._urls.remove(url)
-            save_proxies(self._urls)
+            if url in self._urls:
+                self._urls.remove(url)
             sess = self._sessions.pop(url, None)
         if sess is not None and id(sess) not in self._active:
             await self._close(sess)
         return True
 
     async def replace_all(self, urls: list[str]) -> None:
-        """Заменяет весь список (используется админом при ручной смене PROXY_URL)."""
-        cleaned = [u.strip() for u in (urls or []) if u and u.strip()]
+        """Заменяет весь список в БД и кэше (админский «clear»/массовая замена)."""
+        cleaned = [u for u in (normalize_url(x) for x in (urls or [])) if u]
         async with self._lock:
+            save_proxies(cleaned)          # запись в SQLite (proxy_db.db)
             self._urls = cleaned
-            save_proxies(self._urls)
             keep = set(cleaned)
             stale = [k for k in self._sessions if k not in keep]
             for k in stale:
@@ -269,6 +242,40 @@ class ProxyPool:
 
 # Глобальный пул; фабрика внедряется setup_rotation() из main/config-слоя.
 pool = ProxyPool(factory=lambda url: None)
+
+
+def configure_rotation(bot: Bot, session_factory) -> RotatingSessionProxy:
+    """Точка входа для config.py: миграция старых данных + пул из БД + ротация.
+
+    Порядок:
+    1. migrate_legacy() — перенос PROXY_URL из .env и proxies.json в SQLite,
+       зачистка ключа PROXY_URL из .env (прокси дальше живут только в БД);
+    2. базовая сессия бота пересоздаётся под активный прокси из БД
+       (если он задан) — иначе запросы шли бы через env-прокси в обход пула;
+    3. setup_rotation() подключает обёртку с случайным выбором/ротацией.
+    """
+    urls = migrate_legacy() or load_proxies()
+    active = proxy_db.get_active()
+    base = getattr(bot.session, "_base", bot.session)
+    if active and getattr(base, "proxy", None) != active:
+        new_base = session_factory(active)
+        if isinstance(bot.session, RotatingSessionProxy):
+            bot.session._base = new_base
+        else:
+            bot.session = new_base
+        try:
+            import asyncio as _aio
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:  # старая сессия ещё не открывала коннектор, но закрываем корректно
+            async def _close_later(s=base):
+                try:
+                    await s.close()
+                except Exception as e:  # pragma: no cover
+                    logger.debug("Ошибка закрытия старой базовой сессии: %r", e)
+            loop.create_task(_close_later())
+    return setup_rotation(bot, session_factory, urls)
 
 
 def setup_rotation(bot: Bot, session_factory, urls: list[str]) -> RotatingSessionProxy:

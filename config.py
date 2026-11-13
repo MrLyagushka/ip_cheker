@@ -25,8 +25,9 @@ import os
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# Пул прокси: список в data/proxies.json, рандомный прокси на каждый запрос к
-# Telegram API и ротация на другой прокси при ошибке соединения (см. proxy_pool).
+# Пул прокси: список в БД SQLite data/proxies.db (НЕ .env), рандомный прокси
+# на каждый запрос к Telegram API и ротация на другой прокси при ошибке
+# соединения (см. proxy_db.py / proxy_pool.py).
 import proxy_pool
 from proxy_pool import ProxyPool, pool as proxy_pool_instance
 
@@ -69,6 +70,8 @@ logger = logging.getLogger("config")
 load_env()
 
 TOKEN = os.getenv("TOKEN")
+# PROXY_URL — только источник для ОДНОКРАТНОЙ миграции в БД (proxy_db.migrate_legacy).
+# Постоянное хранилище прокси — SQLite data/proxies.db, НЕ .env.
 PROXY_URL = os.getenv("PROXY_URL") or None
 
 ALERT_CHAT_ID = normalize_int(os.getenv("ALERT_CHAT_ID"), "ALERT_CHAT_ID")
@@ -87,31 +90,47 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 def _initial_proxy_urls() -> list[str]:
-    """Список прокси на старте: data/proxies.json; если пусто — PROXY_URL из .env."""
-    urls = proxy_pool.load_proxies()
-    if not urls and PROXY_URL:
-        urls = [PROXY_URL]
-        proxy_pool.save_proxies(urls)
-    return urls
+    """Список прокси на старте: миграция PROXY_URL из .env и proxies.json в
+    SQLite, затем чтение БД (data/proxies.db)."""
+    urls = proxy_pool.migrate_legacy()
+    if not urls:
+        urls = proxy_pool.load_proxies()
+    return list(urls)
 
 
 # Ротация прокси: bot.session заменяется обёрткой, выбирающей случайный прокси
-# из пула на каждый запрос и переключающейся на другой при ошибке соединения.
-proxy_pool.setup_rotation(bot, build_session, _initial_proxy_urls())
+# из пула (БД) на каждый запрос и переключающейся на другой при ошибке соединения.
+_start_urls = _initial_proxy_urls()
+proxy_pool.setup_rotation(bot, build_session, _start_urls)
+
+# Активный прокси берётся из БД; если он отличается от env-значения (например,
+# только что мигрирован или изменён админом), пересоздаём базовую сессию.
+# В .env прокси больше НЕ пишется — единственный источник истины proxies.db.
+_active = proxy_pool.proxy_db.get_active()
+if _active != PROXY_URL:
+    PROXY_URL = _active
+    _old_base = getattr(bot.session, "_base", bot.session)
+    _new_base = build_session(_active)
+    if isinstance(bot.session, proxy_pool.RotatingSessionProxy):
+        bot.session._base = _new_base
+    else:  # pragma: no cover - ротация всегда установлена выше
+        bot.session = _new_base
+    session = _new_base
+del _initial_proxy_urls, _start_urls, _active
 
 
 def set_proxy(new_url):
-    """Атомарная смена ЕДИНСТВЕННОГО прокси бота (используется админ-панелью).
+    """Атомарная смена АКТИВНОГО прокси бота (используется админ-панелью).
 
-    Обновляет config.PROXY_URL, пересоздаёт сессию через build_session()
-    (валидный AiohttpSession даже при отключённом прокси — Б12), подменяет
-    базовую сессию живого Bot без перезапуска процесса и синхронизирует пул
-    ротации (список прокси = [new_url], либо пуст при отключении). Возвращает
-    СТАРУЮ сессию (или None) — вызывающая сторона ОБЯЗАНА закрыть её
-    асинхронно через `await old.close()` (Этап 6).
+    Хранилище — SQLite (proxy_db): new_url добавляется в таблицу proxies (если
+    его там нет) и помечается активным; в .env НИЧЕГО не пишется. Обновляет
+    config.PROXY_URL, пересоздаёт базовую сессию через build_session(),
+    синхронизирует пул ротации. Возвращает СТАРУЮ сессию (или None) —
+    вызывающая сторона ОБЯЗАНА закрыть её асинхронно `await old.close()` (Этап 6).
 
-    Для накопительного списка прокси (рандомный выбор + ротация при ошибках)
-    служит pool.add()/pool.replace_all() — см. handlers/admin.py «🌐 Пул прокси».
+    Для управления списком (рандомный выбор + ротация при ошибках) служит
+    pool.add()/pool.remove()/pool.replace_all() — см. handlers/admin.py
+    «🧾 Пул прокси».
     """
     global PROXY_URL, session
     new_url = (new_url or "").strip() or None
@@ -124,7 +143,12 @@ def set_proxy(new_url):
         bot.session = new_session
     session = new_session
     PROXY_URL = new_url
-    save_env_value("PROXY_URL", new_url or "")
+    # Единственный источник истины — БД (не .env):
+    if new_url:
+        proxy_pool.proxy_db.set_active(new_url)   # добавит строку, если её нет
+    else:
+        proxy_pool.proxy_db.set_active(None)
+    urls = proxy_pool.proxy_db.list_urls()
     # Пул должен пережить смену: иначе запросы пойдут через старый (закрываемый) прокси.
     try:
         import asyncio
@@ -132,7 +156,7 @@ def set_proxy(new_url):
     except RuntimeError:
         loop = None
     if loop is not None:
-        loop.create_task(proxy_pool.pool.replace_all([new_url] if new_url else []))
+        loop.create_task(proxy_pool.pool.replace_all(urls))
     else:  # pragma: no cover - только вне event loop (тесты/CLI)
-        proxy_pool.pool.configure([new_url] if new_url else [])
+        proxy_pool.pool.configure(urls)
     return old_session

@@ -65,13 +65,14 @@ def _threads_line() -> str:
 
 
 def _proxy_line() -> str:
-    """Строка о прокси в панели: активный + размер пула ротации."""
+    """Строка о прокси в панели: активный (из БД) + размер пула ротации."""
     active = proxy_pool.mask_url(config.PROXY_URL) if config.PROXY_URL \
         else "Отключен (прямое соединение)"
     n = len(proxy_pool.pool.urls)
     return (f"🌐 Текущий прокси: <code>{active}</code>\n"
             f"🔄 Прокси в пуле: <code>{n}</code> "
-            f"(выбор случайного на каждый запрос, ротация при ошибке)")
+            f"(БД <code>proxies.db</code>, выбор случайного на каждый запрос, "
+            f"ротация при ошибке)")
 
 
 class AdminStates(StatesGroup):
@@ -262,12 +263,15 @@ def _proxy_list_kb() -> InlineKeyboardMarkup | None:
 
 async def _proxy_list_text() -> str:
     urls = proxy_pool.pool.urls
-    lines = ["🧾 <b>Пул прокси</b> (бот выбирает случайный на каждый запрос,\n"
+    active = proxy_pool.proxy_db.get_active()
+    lines = ["🧾 <b>Пул прокси</b> (хранится в БД <code>proxies.db</code>; бот "
+             "выбирает случайный на каждый запрос,\n"
              "при ошибке соединения Telegram — переключается на другой):\n"]
     if not urls:
-        lines.append("Пусто. Добавьте прокси через «🌐 Прокси».")
+        lines.append("Пусто. Добавьте прокси через «🌐 Прокси» или /add_proxy.")
     for i, u in enumerate(urls, 1):
-        lines.append(f"{i}. <code>{proxy_pool.mask_url(u)}</code>")
+        mark = " ⭐ активный" if u == active else ""
+        lines.append(f"{i}. <code>{proxy_pool.mask_url(u)}</code>{mark}")
     return "\n".join(lines)
 
 
@@ -338,18 +342,22 @@ async def process_new_proxy(message: Message, state: FSMContext):
         return
     elif low == "clear":
         await state.clear()
-        await proxy_pool.pool.replace_all([])
-        old = config.set_proxy(None)
+        # «clear» чистит только БД-пул; если активный прокси был — переключаемся
+        # на прямое соединение (set_proxy(None) сам снимет active в БД).
+        old = config.set_proxy(None) if config.PROXY_URL else None
+        await proxy_pool.pool.replace_all([])   # синхронизирует кэш пула с БД
         if old is not None:
             try:
                 await old.close()
             except Exception as e:
                 logger.warning("Не удалось закрыть старую сессию: %r", e)
-        await message.answer("🧹 Пул прокси очищен, прокси отключён (прямое соединение).")
+        await message.answer("🧹 Пул прокси очищен (БД), прокси отключён "
+                             "(прямое соединение).")
         return
     # Этап 1+6: вся атомарная логика смены прокси в config.set_proxy():
     # обновляет PROXY_URL, строит НОВУЮ валидную AiohttpSession (никогда не
-    # None — Б12), подменяет bot.session и пишет чистое значение в .env.
+    # None — Б12), подменяет базовую сессию живого бота и делает URL активным
+    # в БД proxies.db (в .env больше НЕ пишет).
     old_session = config.set_proxy(new_proxy)
     if old_session is not None:
         try:
@@ -361,9 +369,12 @@ async def process_new_proxy(message: Message, state: FSMContext):
             logger.warning("Не удалось закрыть старую сессию: %r", e)
     added = False
     if new_proxy:
-        # Новый прокси ВСЕГДА попадает в список пула: бот начнёт выбирать его
+        # Новый прокси ВСЕГДА попадает в список пула (БД): бот начнёт выбирать его
         # случайно наряду с остальными (требование: «заносится в список прокси»).
-        added = await proxy_pool.pool.add(new_proxy)
+        # set_proxy() уже добавил/активировал его в proxies.db; add() вернёт
+        # False как дубликат — это нормально, сверяемся со списком.
+        await proxy_pool.pool.add(new_proxy)
+        added = new_proxy in proxy_pool.pool.urls
     await state.clear()
 
     status_text = f"<b>{proxy_pool.mask_url(config.PROXY_URL)}</b>" if config.PROXY_URL \
@@ -371,8 +382,8 @@ async def process_new_proxy(message: Message, state: FSMContext):
     n = len(proxy_pool.pool.urls)
     note = " Добавлен в список прокси." if added else ""
     await message.answer(
-        f"✅ Прокси успешно изменен на: {status_text} и сохранен в <code>.env</code>."
-        f"{note}\n🔄 В пуле: {n} шт.",
+        f"✅ Прокси успешно изменен на: {status_text} и сохранен в <b>БД прокси</b> "
+        f"(<code>proxies.db</code>).{note}\n🔄 В пуле: {n} шт.",
         parse_mode="HTML")
 
 
