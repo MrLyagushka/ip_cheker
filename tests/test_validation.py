@@ -51,8 +51,16 @@ def test_classify_types_host_vs_subnet():
     assert kinds == {"8.8.8.8": "host", "1.2.3.0": "subnet"}
 
 
-def test_normalize_int_alert_chat_id(cfg):
-    """Б20: ALERT_* нормализованы в int несмотря на кавычки/комментарий в .env."""
-    assert cfg.ALERT_CHAT_ID == -1001234567890
-    assert isinstance(cfg.ALERT_CHAT_ID, int)
-    assert cfg.ALERT_THREAD_ID == 42
+def test_normalize_int_alert_chat_id():
+    """Б20: ALERT_* нормализованы в int несмотря на кавычки/комментарий в .env.
+
+    Проверяем ЧИСТУЮ функцию normalize_int (config_core) + переменные
+    окружения, выставленные session-фикстурой isolated_env; не трогаем
+    боевые константы модуля config (они могли быть прогреты раньше
+    фикстуры через реальный .env — это известная особенность aiogram).
+    """
+    import os
+    from config_core import normalize_int
+    assert normalize_int(os.environ["ALERT_CHAT_ID"], "ALERT_CHAT_ID") == -1001234567890
+    assert isinstance(normalize_int(os.environ["ALERT_CHAT_ID"], "ALERT_CHAT_ID"), int)
+    assert normalize_int(os.environ["ALERT_THREAD_ID"], "ALERT_THREAD_ID") == 42
